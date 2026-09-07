@@ -1,6 +1,6 @@
 {
   "name": "obsidian-safe-webdav-sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Free encrypted WebDAV sync for Obsidian with safe three-way Markdown merging",
   "scripts": {

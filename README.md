@@ -22,4 +22,7 @@ Install with BRAT from this repository, then disable the original Remotely Save
 plugin. Safe WebDAV Sync reads its settings file locally, so no password is
 stored in this repository.
 
+The first installed run is intentionally manual. Use “Проверить план” once,
+then enable automatic sync after the initial index has been created.
+
 > Do not enable two synchronization plugins at the same time.

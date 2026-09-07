@@ -4,7 +4,7 @@ import { SyncEngine } from "./sync";
 import type { PersistedData, PluginSettings, SyncSummary } from "./types";
 
 const DEFAULT_SETTINGS: PluginSettings = {
-  autoSync: true,
+  autoSync: false,
   syncOnSave: true,
   intervalMs: 300000,
   sourcePluginId: "remotely-save"
