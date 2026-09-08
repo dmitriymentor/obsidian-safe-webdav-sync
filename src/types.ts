@@ -50,3 +50,11 @@ export interface SyncSummary {
   unchanged: number;
   errors: string[];
 }
+
+export interface SyncProgress {
+  phase: "local" | "remote" | "files" | "saving";
+  label: string;
+  completed: number;
+  total: number;
+  path?: string;
+}

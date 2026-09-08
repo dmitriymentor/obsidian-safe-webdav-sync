@@ -15,6 +15,8 @@ publishing credentials.
 - Non-text conflicts keep both versions instead of silently choosing one.
 - The `updated:` YAML field is merged separately to avoid timestamp-only
   conflicts caused by “Update time on edit”.
+- Manual sync displays a live progress window with the current phase, file,
+  processed count, percentage, and final summary.
 
 ## Installation
 

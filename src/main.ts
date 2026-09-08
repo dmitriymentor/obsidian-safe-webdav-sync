@@ -1,7 +1,7 @@
-import { Notice, Plugin, PluginSettingTab, Setting, type App } from "obsidian";
+import { Modal, Notice, Plugin, PluginSettingTab, Setting, type App } from "obsidian";
 import { importRemotelySaveConfig } from "./import-config";
 import { SyncEngine } from "./sync";
-import type { PersistedData, PluginSettings, SyncSummary } from "./types";
+import type { PersistedData, PluginSettings, SyncProgress, SyncSummary } from "./types";
 
 const DEFAULT_SETTINGS: PluginSettings = {
   autoSync: false,
@@ -75,28 +75,105 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   }
 
   async sync(dryRun: boolean, reason: string): Promise<void> {
-    if (this.running) return;
+    const interactive = ["вручную", "командой", "настройки", "проверка"].includes(reason);
+    if (this.running) {
+      if (interactive) new Notice("Safe Sync уже выполняется. Прогресс виден в нижней строке состояния.");
+      return;
+    }
     if (this.sourcePluginEnabled()) {
       new Notice("Синхронизация не запущена: сначала отключите Remotely Save.", 8000);
       return;
     }
     this.running = true;
+    const progressModal = interactive ? new SyncProgressModal(this.app, dryRun) : undefined;
+    progressModal?.open();
     this.statusEl?.setText(dryRun ? "Safe Sync: проверка…" : "Safe Sync: синхронизация…");
     try {
+      progressModal?.update({ phase: "remote", label: "Подключаюсь к WebDAV", completed: 0, total: 1 });
       const config = await importRemotelySaveConfig(this.app.vault.adapter, this.data.settings.sourcePluginId);
-      const engine = new SyncEngine(this.app, config, this.data.state, () => this.persist());
+      const engine = new SyncEngine(this.app, config, this.data.state, () => this.persist(), (progress) => {
+        progressModal?.update(progress);
+        const count = progress.total > 1 ? ` ${progress.completed}/${progress.total}` : "";
+        this.statusEl?.setText(`Safe Sync: ${progress.label}${count}`);
+      });
       const summary = await engine.run(dryRun);
       const report = formatSummary(summary, dryRun);
       this.statusEl?.setText(summary.errors.length ? "Safe Sync: есть ошибки" : "Safe Sync: готов");
-      if (dryRun || summary.conflicts || summary.errors.length) new Notice(`${report}\nЗапуск: ${reason}`, 12000);
+      progressModal?.finish(report, summary.errors);
+      if (!progressModal || summary.conflicts || summary.errors.length) new Notice(`${report}\nЗапуск: ${reason}`, 12000);
       console.info(`[safe-webdav-sync] ${report}`);
     } catch (error) {
       this.statusEl?.setText("Safe Sync: ошибка");
+      progressModal?.fail(message(error));
       new Notice(`Safe Sync: ${message(error)}`, 12000);
       console.error("[safe-webdav-sync]", error);
     } finally {
       this.running = false;
     }
+  }
+}
+
+class SyncProgressModal extends Modal {
+  private readonly dryRun: boolean;
+  private progressEl!: HTMLProgressElement;
+  private phaseEl!: HTMLElement;
+  private countEl!: HTMLElement;
+  private pathEl!: HTMLElement;
+  private actionsEl!: HTMLElement;
+
+  constructor(app: App, dryRun: boolean) {
+    super(app);
+    this.dryRun = dryRun;
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(this.dryRun ? "Проверка синхронизации" : "Синхронизация");
+    this.contentEl.empty();
+    this.phaseEl = this.contentEl.createEl("h3", { text: "Подготовка…" });
+    this.progressEl = this.contentEl.createEl("progress");
+    this.progressEl.max = 100;
+    this.progressEl.value = 0;
+    this.progressEl.style.width = "100%";
+    this.progressEl.style.height = "18px";
+    this.progressEl.setAttr("aria-label", "Прогресс синхронизации");
+    this.countEl = this.contentEl.createEl("p", { text: "0%" });
+    this.pathEl = this.contentEl.createEl("small", { text: "Подключение к серверу…" });
+    this.pathEl.style.display = "block";
+    this.pathEl.style.overflowWrap = "anywhere";
+    this.actionsEl = this.contentEl.createDiv();
+    this.actionsEl.style.marginTop = "18px";
+  }
+
+  update(progress: SyncProgress): void {
+    if (!this.progressEl) return;
+    const percent = progress.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
+    this.phaseEl.setText(progress.label);
+    this.progressEl.value = percent;
+    this.countEl.setText(progress.total > 1
+      ? `${percent}% · ${progress.completed} из ${progress.total}`
+      : `${percent}%`);
+    this.pathEl.setText(progress.path ?? "");
+  }
+
+  finish(report: string, errors: string[]): void {
+    this.titleEl.setText(errors.length ? "Синхронизация завершена с ошибками" : "Синхронизация завершена");
+    this.phaseEl.setText(report);
+    this.progressEl.value = 100;
+    this.countEl.setText("100%");
+    this.pathEl.setText(errors.length ? errors.slice(0, 3).join("\n") : "Все файлы обработаны.");
+    this.addCloseButton();
+  }
+
+  fail(error: string): void {
+    this.titleEl.setText("Ошибка синхронизации");
+    this.phaseEl.setText(error);
+    this.pathEl.setText("Файлы, обработанные до ошибки, остаются в безопасном состоянии.");
+    this.addCloseButton();
+  }
+
+  private addCloseButton(): void {
+    this.actionsEl.empty();
+    new Setting(this.actionsEl).addButton((button) => button.setCta().setButtonText("Закрыть").onClick(() => this.close()));
   }
 }
 

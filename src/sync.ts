@@ -1,7 +1,7 @@
 import { normalizePath, TFile, type App } from "obsidian";
 import { RcloneCrypto } from "./crypto";
 import { mergeMarkdown } from "./merge";
-import type { FileState, ImportedConfig, RemoteEntry, SyncSummary } from "./types";
+import type { FileState, ImportedConfig, RemoteEntry, SyncProgress, SyncSummary } from "./types";
 import { WebDav, type RawRemoteEntry } from "./webdav";
 
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -43,17 +43,20 @@ export class SyncEngine {
   private readonly crypt: RcloneCrypto;
   private readonly state: Record<string, FileState>;
   private readonly saveState: () => Promise<void>;
+  private readonly onProgress?: (progress: SyncProgress) => void;
 
   constructor(
     app: App,
     config: ImportedConfig,
     state: Record<string, FileState>,
-    saveState: () => Promise<void>
+    saveState: () => Promise<void>,
+    onProgress?: (progress: SyncProgress) => void
   ) {
     this.app = app;
     this.config = config;
     this.state = state;
     this.saveState = saveState;
+    this.onProgress = onProgress;
     this.webdav = new WebDav(config.address, config.username, config.webdavPassword, config.remoteBaseDir);
     this.crypt = new RcloneCrypto(config.encryptionPassword);
   }
@@ -70,23 +73,46 @@ export class SyncEngine {
       deleted: 0, unchanged: 0, errors: []
     };
     const local = new Map<string, { file: TFile; bytes: ArrayBuffer; hash: string }>();
-    for (const file of this.app.vault.getFiles()) {
+    const localFiles = this.app.vault.getFiles().filter((file) => !shouldSkip(file.path));
+    this.progress("local", "Читаю локальные файлы", 0, localFiles.length);
+    for (let index = 0; index < localFiles.length; index++) {
+      const file = localFiles[index]!;
       if (shouldSkip(file.path)) continue;
       const bytes = await this.app.vault.readBinary(file);
       local.set(file.path, { file, bytes, hash: await hashBuffer(bytes) });
+      this.progress("local", "Читаю локальные файлы", index + 1, localFiles.length, file.path);
     }
+    this.progress("remote", "Получаю список с сервера", 0, 1);
     const remote = await this.readRemoteIndex();
+    this.progress("remote", "Список с сервера получен", 1, 1);
     const paths = [...new Set([...local.keys(), ...remote.keys(), ...Object.keys(this.state)])].sort();
 
-    for (const path of paths) {
+    for (let index = 0; index < paths.length; index++) {
+      const path = paths[index]!;
+      this.progress("files", "Синхронизирую файлы", index, paths.length, path);
       try {
         await this.syncOne(path, local.get(path), remote.get(path), dryRun, summary);
       } catch (error) {
         summary.errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
       }
+      this.progress("files", "Синхронизирую файлы", index + 1, paths.length, path);
     }
-    if (!dryRun) await this.saveState();
+    if (!dryRun) {
+      this.progress("saving", "Сохраняю индекс синхронизации", 0, 1);
+      await this.saveState();
+      this.progress("saving", "Индекс сохранён", 1, 1);
+    }
     return summary;
+  }
+
+  private progress(
+    phase: SyncProgress["phase"],
+    label: string,
+    completed: number,
+    total: number,
+    path?: string
+  ): void {
+    this.onProgress?.({ phase, label, completed, total, path });
   }
 
   private async readRemoteIndex(): Promise<Map<string, RemoteEntry>> {
