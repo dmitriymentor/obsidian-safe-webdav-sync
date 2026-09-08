@@ -1,7 +1,7 @@
 {
   "id": "safe-webdav-sync",
   "name": "Safe WebDAV Sync",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "minAppVersion": "1.5.0",
   "description": "Encrypted WebDAV sync with three-way Markdown merging and recoverable conflicts.",
   "author": "dmitriymentor",

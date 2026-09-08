@@ -63,7 +63,11 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   async checkConnection(): Promise<void> {
     try {
       this.statusEl?.setText("Safe Sync: проверка…");
-      const config = await importRemotelySaveConfig(this.app.vault.adapter, this.data.settings.sourcePluginId);
+      const config = await importRemotelySaveConfig(
+        this.app.vault.adapter,
+        this.data.settings.sourcePluginId,
+        this.app.vault.getName()
+      );
       const engine = new SyncEngine(this.app, config, this.data.state, () => this.persist());
       await engine.check();
       this.statusEl?.setText("Safe Sync: подключено");
@@ -90,7 +94,11 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     this.statusEl?.setText(dryRun ? "Safe Sync: проверка…" : "Safe Sync: синхронизация…");
     try {
       progressModal?.update({ phase: "remote", label: "Подключаюсь к WebDAV", completed: 0, total: 1 });
-      const config = await importRemotelySaveConfig(this.app.vault.adapter, this.data.settings.sourcePluginId);
+      const config = await importRemotelySaveConfig(
+        this.app.vault.adapter,
+        this.data.settings.sourcePluginId,
+        this.app.vault.getName()
+      );
       const engine = new SyncEngine(this.app, config, this.data.state, () => this.persist(), (progress) => {
         progressModal?.update(progress);
         const count = progress.total > 1 ? ` ${progress.completed}/${progress.total}` : "";

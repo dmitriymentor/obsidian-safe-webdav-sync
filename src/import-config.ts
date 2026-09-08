@@ -13,7 +13,8 @@ function decodeMessyConfig(raw: unknown): any {
 
 export async function importRemotelySaveConfig(
   adapter: DataAdapter,
-  sourcePluginId: string
+  sourcePluginId: string,
+  vaultName: string
 ): Promise<ImportedConfig> {
   const path = `.obsidian/plugins/${sourcePluginId}/data.json`;
   if (!(await adapter.exists(path))) {
@@ -36,10 +37,17 @@ export async function importRemotelySaveConfig(
     username: String(webdav.username),
     webdavPassword: String(webdav.password),
     authType: "basic",
-    remoteBaseDir: String(webdav.remoteBaseDir || "").replace(/^\/+|\/+$/g, ""),
+    remoteBaseDir: resolveRemoteBaseDir(webdav.remoteBaseDir, vaultName),
     encryptionPassword: String(decoded.password),
     encryptionMethod: String(decoded.encryptionMethod),
     autoRunEveryMilliseconds: Number(decoded.autoRunEveryMilliseconds) || 300000,
     syncOnSaveAfterMilliseconds: Number(decoded.syncOnSaveAfterMilliseconds) || 1000
   };
+}
+
+export function resolveRemoteBaseDir(remoteBaseDir: unknown, vaultName: string): string {
+  // Remotely Save uses the vault name whenever this setting is empty.
+  // Matching that fallback is essential: an empty string means the vault
+  // folder, not the WebDAV account root.
+  return String(remoteBaseDir || vaultName).replace(/^\/+|\/+$/g, "");
 }

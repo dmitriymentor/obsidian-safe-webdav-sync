@@ -10,8 +10,10 @@ publishing credentials.
   `remote`). Non-overlapping edits merge automatically.
 - Overlapping edits are kept in the note with visible conflict markers and both
   complete versions are copied to `Safe Sync Backups`.
-- Deletions are recoverable: remote deletions are backed up locally; local
-  deletions move the encrypted remote object into `.safe-sync-safety`.
+- Missing files are restored from the other side. Automatic deletion is
+  intentionally disabled until durable cross-device tombstones are available.
+- A mass-change guard aborts the run if WebDAV suddenly returns less than half
+  of the previously indexed remote files.
 - Non-text conflicts keep both versions instead of silently choosing one.
 - The `updated:` YAML field is merged separately to avoid timestamp-only
   conflicts caused by “Update time on edit”.
@@ -28,3 +30,7 @@ The first installed run is intentionally manual. Use “Проверить пл�
 then enable automatic sync after the initial index has been created.
 
 > Do not enable two synchronization plugins at the same time.
+
+When Remotely Save's remote directory field is empty, this plugin mirrors its
+behavior and uses the vault name. This prevents mobile devices from syncing to
+the WebDAV account root by mistake.

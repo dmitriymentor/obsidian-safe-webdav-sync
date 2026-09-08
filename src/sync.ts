@@ -85,6 +85,12 @@ export class SyncEngine {
     this.progress("remote", "Получаю список с сервера", 0, 1);
     const remote = await this.readRemoteIndex();
     this.progress("remote", "Список с сервера получен", 1, 1);
+    const expectedRemoteCount = Object.values(this.state).filter((item) => item.existsRemote).length;
+    if (expectedRemoteCount >= 10 && remote.size < expectedRemoteCount * 0.5) {
+      throw new Error(
+        `Защитная остановка: сервер вернул только ${remote.size} из ожидаемых ${expectedRemoteCount} файлов. Локальные файлы не изменены.`
+      );
+    }
     const paths = [...new Set([...local.keys(), ...remote.keys(), ...Object.keys(this.state)])].sort();
 
     for (let index = 0; index < paths.length; index++) {
@@ -180,29 +186,20 @@ export class SyncEngine {
     if (!local && remote) {
       const rbytes = await this.remoteBytes(remote);
       const rhash = await hashBuffer(rbytes);
-      if (previous.existsLocal && rhash === previous.baseHash) {
-        if (!dryRun) await this.archiveRemoteDeletion(path, remote);
-        if (!dryRun) delete this.state[path];
-        summary.deleted++;
-      } else {
-        if (!dryRun) await this.writeLocal(path, rbytes);
-        if (!dryRun) this.state[path] = this.makeState(rbytes, rhash, remote.etag);
-        summary.downloaded++;
-      }
+      // A missing local file can be an incomplete mobile listing or an app-side
+      // move. Restore from the encrypted server instead of deleting remotely.
+      if (!dryRun) await this.writeLocal(path, rbytes);
+      if (!dryRun) this.state[path] = this.makeState(rbytes, rhash, remote.etag);
+      summary.downloaded++;
       return;
     }
 
     if (local && !remote) {
-      const localChanged = local.hash !== previous.baseHash;
-      if (previous.existsRemote && !localChanged) {
-        if (!dryRun) await this.backupLocal(path, local.bytes, "удалено-на-сервере");
-        if (!dryRun) await this.app.fileManager.trashFile(local.file);
-        if (!dryRun) delete this.state[path];
-        summary.deleted++;
-      } else {
-        if (!dryRun) this.state[path] = await this.uploadAndState(path, local.bytes, local.hash);
-        summary.uploaded++;
-      }
+      // Never infer a remote deletion from one incomplete WebDAV response.
+      // Re-uploading is lossless; explicit deletion sync can be added later
+      // with durable tombstones acknowledged by both devices.
+      if (!dryRun) this.state[path] = await this.uploadAndState(path, local.bytes, local.hash);
+      summary.uploaded++;
       return;
     }
 
@@ -295,11 +292,6 @@ export class SyncEngine {
     else await this.app.vault.createBinary(path, bytes);
   }
 
-  private async backupLocal(path: string, bytes: ArrayBuffer, reason: string): Promise<void> {
-    const backupPath = `${LOCAL_BACKUPS}/${safeTimestamp()}-${reason}/${path}`;
-    await this.writeLocal(backupPath, bytes);
-  }
-
   private async backupBoth(path: string, local: ArrayBuffer, remote: ArrayBuffer): Promise<void> {
     const stamp = safeTimestamp();
     await this.writeLocal(`${LOCAL_BACKUPS}/${stamp}-конфликт/Локальная/${path}`, local);
@@ -308,8 +300,4 @@ export class SyncEngine {
     await this.upload(`${SAFETY_PREFIX}${stamp}/remote/${path}`, remote);
   }
 
-  private async archiveRemoteDeletion(path: string, remote: RemoteEntry): Promise<void> {
-    const archived = await this.crypt.encryptPath(`${SAFETY_PREFIX}${safeTimestamp()}/deleted-local/${path}`);
-    await this.webdav.move(remote.encryptedPath, archived);
-  }
 }
