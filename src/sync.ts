@@ -123,7 +123,8 @@ export class SyncEngine {
 
   private async readRemoteIndex(): Promise<Map<string, RemoteEntry>> {
     const index = new Map<string, RemoteEntry>();
-    for (const raw of await this.webdav.list()) {
+    for (const raw of await this.webdav.list((completed, total) =>
+      this.progress("remote", "Читаю папки сервера", completed, total))) {
       try {
         const path = (await this.crypt.decryptPath(raw.encryptedPath)).replace(/^\/+/, "").replace(/\/+$/, "");
         if (!path || raw.isDirectory || shouldSkip(path)) continue;

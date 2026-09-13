@@ -62,7 +62,7 @@ export class WebDav {
     });
   }
 
-  async list(): Promise<RawRemoteEntry[]> {
+  async list(onProgress?: (completed: number, total: number) => void): Promise<RawRemoteEntry[]> {
     const found = new Map<string, RawRemoteEntry>();
     const queue = [""];
     const visited = new Set<string>();
@@ -96,6 +96,7 @@ export class WebDav {
         found.set(relative, entry);
         if (isDirectory) queue.push(relative);
       }
+      onProgress?.(visited.size, visited.size + queue.length);
     }
     return [...found.values()];
   }

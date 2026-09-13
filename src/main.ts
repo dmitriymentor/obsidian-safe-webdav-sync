@@ -15,6 +15,21 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   private running = false;
   private saveTimer: number | undefined;
   private statusEl: HTMLElement | undefined;
+  private progressModal: SyncProgressModal | undefined;
+  private lastProgress: SyncProgress | undefined;
+  private activeDryRun = false;
+  private startedAt = 0;
+
+  private clearProgress(): void {
+    this.progressModal?.close();
+    this.progressModal = undefined;
+  }
+
+  private showProgress(): void {
+    this.progressModal ??= new SyncProgressModal(this.app, this.activeDryRun, this.startedAt);
+    this.progressModal.show();
+    if (this.lastProgress) this.progressModal.update(this.lastProgress);
+  }
 
   async onload(): Promise<void> {
     const loaded = (await this.loadData()) as Partial<PersistedData> | null;
@@ -49,6 +64,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
 
   onunload(): void {
     window.clearTimeout(this.saveTimer);
+    this.progressModal?.close();
   }
 
   sourcePluginEnabled(): boolean {
@@ -81,7 +97,9 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   async sync(dryRun: boolean, reason: string): Promise<void> {
     const interactive = ["вручную", "командой", "настройки", "проверка"].includes(reason);
     if (this.running) {
-      if (interactive) new Notice("Safe Sync уже выполняется. Прогресс виден в нижней строке состояния.");
+      // On mobile the status bar may be hidden. Attach to the active run,
+      // including an automatic run, rather than only displaying a toast.
+      if (interactive) this.showProgress();
       return;
     }
     if (this.sourcePluginEnabled()) {
@@ -89,30 +107,35 @@ export default class SafeWebDavSyncPlugin extends Plugin {
       return;
     }
     this.running = true;
-    const progressModal = interactive ? new SyncProgressModal(this.app, dryRun) : undefined;
-    progressModal?.open();
+    this.clearProgress();
+    this.activeDryRun = dryRun;
+    this.startedAt = Date.now();
+    this.lastProgress = { phase: "local", label: "Подготовка…", completed: 0, total: 0 };
+    if (interactive) this.showProgress();
     this.statusEl?.setText(dryRun ? "Safe Sync: проверка…" : "Safe Sync: синхронизация…");
     try {
-      progressModal?.update({ phase: "remote", label: "Подключаюсь к WebDAV", completed: 0, total: 1 });
+      // Yield once so the dialog paints before reading or encrypting files.
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
       const config = await importRemotelySaveConfig(
         this.app.vault.adapter,
         this.data.settings.sourcePluginId,
         this.app.vault.getName()
       );
       const engine = new SyncEngine(this.app, config, this.data.state, () => this.persist(), (progress) => {
-        progressModal?.update(progress);
+        this.lastProgress = progress;
+        this.progressModal?.update(progress);
         const count = progress.total > 1 ? ` ${progress.completed}/${progress.total}` : "";
         this.statusEl?.setText(`Safe Sync: ${progress.label}${count}`);
       });
       const summary = await engine.run(dryRun);
       const report = formatSummary(summary, dryRun);
       this.statusEl?.setText(summary.errors.length ? "Safe Sync: есть ошибки" : "Safe Sync: готов");
-      progressModal?.finish(report, summary.errors);
-      if (!progressModal || summary.conflicts || summary.errors.length) new Notice(`${report}\nЗапуск: ${reason}`, 12000);
+      this.progressModal?.finish(report, summary.errors);
+      if (!this.progressModal?.visible || summary.conflicts || summary.errors.length) new Notice(`${report}\nЗапуск: ${reason}`, 12000);
       console.info(`[safe-webdav-sync] ${report}`);
     } catch (error) {
       this.statusEl?.setText("Safe Sync: ошибка");
-      progressModal?.fail(message(error));
+      this.progressModal?.fail(message(error));
       new Notice(`Safe Sync: ${message(error)}`, 12000);
       console.error("[safe-webdav-sync]", error);
     } finally {
@@ -122,6 +145,12 @@ export default class SafeWebDavSyncPlugin extends Plugin {
 }
 
 class SyncProgressModal extends Modal {
+  visible = false;
+  private timer: number | undefined;
+  private elapsedEl!: HTMLElement;
+  private last: SyncProgress | undefined;
+  private percent = 0;
+  private readonly startedAt: number;
   private readonly dryRun: boolean;
   private progressEl!: HTMLProgressElement;
   private phaseEl!: HTMLElement;
@@ -129,12 +158,23 @@ class SyncProgressModal extends Modal {
   private pathEl!: HTMLElement;
   private actionsEl!: HTMLElement;
 
-  constructor(app: App, dryRun: boolean) {
+  constructor(app: App, dryRun: boolean, startedAt: number) {
     super(app);
     this.dryRun = dryRun;
+    this.startedAt = startedAt;
+  }
+
+  show(): void {
+    if (!this.visible) this.open();
+  }
+
+  onClose(): void {
+    this.visible = false;
+    window.clearInterval(this.timer);
   }
 
   onOpen(): void {
+    this.visible = true;
     this.titleEl.setText(this.dryRun ? "Проверка синхронизации" : "Синхронизация");
     this.contentEl.empty();
     this.phaseEl = this.contentEl.createEl("h3", { text: "Подготовка…" });
@@ -150,20 +190,36 @@ class SyncProgressModal extends Modal {
     this.pathEl.style.overflowWrap = "anywhere";
     this.actionsEl = this.contentEl.createDiv();
     this.actionsEl.style.marginTop = "18px";
+    this.elapsedEl = this.contentEl.createEl("small");
+    const tick = () => this.elapsedEl.setText(`Прошло ${Math.floor((Date.now() - this.startedAt) / 1000)} с · Закрытие окна не останавливает синхронизацию`);
+    tick();
+    this.timer = window.setInterval(tick, 1000);
+    if (this.last) this.update(this.last);
   }
 
   update(progress: SyncProgress): void {
+    this.last = progress;
     if (!this.progressEl) return;
-    const percent = progress.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
+    const fraction = progress.total > 0 ? progress.completed / progress.total : 0;
+    const next = progress.phase === "local" ? fraction * 10
+      : progress.phase === "remote" ? 10
+      : progress.phase === "files" ? 10 + fraction * 85 : 95 + fraction * 4;
+    this.percent = Math.max(this.percent, Math.min(99, Math.round(next)));
     this.phaseEl.setText(progress.label);
-    this.progressEl.value = percent;
-    this.countEl.setText(progress.total > 1
-      ? `${percent}% · ${progress.completed} из ${progress.total}`
-      : `${percent}%`);
+    if (progress.phase === "remote" || progress.total === 0) {
+      this.progressEl.removeAttribute("value");
+      this.countEl.setText(progress.phase === "remote" && progress.completed > 0
+        ? `Проверено папок: ${progress.completed} · Выполняется…` : "Выполняется…");
+    } else {
+      this.progressEl.value = this.percent;
+      this.countEl.setText(`${this.percent}% · ${progress.completed} из ${progress.total}`);
+    }
     this.pathEl.setText(progress.path ?? "");
   }
 
   finish(report: string, errors: string[]): void {
+    window.clearInterval(this.timer);
+    this.elapsedEl.setText(`Завершено за ${Math.floor((Date.now() - this.startedAt) / 1000)} с`);
     this.titleEl.setText(errors.length ? "Синхронизация завершена с ошибками" : "Синхронизация завершена");
     this.phaseEl.setText(report);
     this.progressEl.value = 100;
@@ -173,6 +229,7 @@ class SyncProgressModal extends Modal {
   }
 
   fail(error: string): void {
+    window.clearInterval(this.timer);
     this.titleEl.setText("Ошибка синхронизации");
     this.phaseEl.setText(error);
     this.pathEl.setText("Файлы, обработанные до ошибки, остаются в безопасном состоянии.");
@@ -197,6 +254,7 @@ class SafeSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Safe WebDAV Sync" });
+    containerEl.createEl("small", { text: `Версия ${this.plugin.manifest.version}` });
     containerEl.createEl("p", {
       text: "Плагин локально читает WebDAV и пароль RClone Crypt из Remotely Save. Секреты не попадают в репозиторий."
     });
@@ -217,7 +275,7 @@ class SafeSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Синхронизировать")
-      .setDesc("Запускает двустороннюю синхронизацию с безопасным слиянием.")
+      .setDesc("Открывает прогресс текущей синхронизации или запускает новую.")
       .addButton((button) => button.setCta().setButtonText("Запустить").onClick(() => void this.plugin.sync(false, "настройки")));
 
     new Setting(containerEl)

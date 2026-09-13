@@ -32,7 +32,11 @@ publishing credentials.
 - The `updated:` YAML field is merged separately to avoid timestamp-only
   conflicts caused by “Update time on edit”.
 - Manual sync displays a live progress window with the current phase, file,
-  processed count, percentage, and final summary.
+  processed count, percentage, elapsed time, and final summary. Pressing sync
+  during a background run opens the same run's progress instead of starting a
+  second run. Closing and reopening the window keeps the current progress.
+  While the server is being scanned, an indeterminate indicator and the number
+  of scanned folders are shown; 100% is displayed only after completion.
 
 ## Installation
 

@@ -1,15 +1,15 @@
-Conflict resolution now keeps one variant in each overlapping Markdown region,
-chosen from the newer note. Independent edits still merge. Content-based
-alignment handles shifted lines and carries edits into uniquely recognized moved
-blocks. Incompatible moves of the same block keep the newer document.
+Pressing Sync now opens live progress even when an automatic run is already
+active. It attaches to the current run and does not start a second sync.
 
-The comparison uses original YAML updated dates, falling back to filesystem and
-WebDAV modification times. Equal dates prefer the server. This is file-level
-recency, not per-line edit history. Original conflict versions remain in separate
-backups. Automatic file deletion remains disabled.
+The window shows the phase, scanned folder count, processed files, current file,
+elapsed time, and final result or error. It can be closed and reopened during
+the same run. Server discovery uses an indeterminate indicator; 100% appears
+only when the run finishes. The installed version is visible in plugin settings.
 
-Validation: 17 passing tests covering shifted lines, moved blocks, adjacent edits,
-timestamp precedence, conflict selection and legacy conflict repair; TypeScript
-checks and production bundle build.
+The 0.1.4 merge policy and backups are unchanged. This update does not add
+automatic legacy repair or arbitrary duplicate-line removal.
 
-Update every device through BRAT before continuing to edit and sync.
+Validation: 20 passing tests, including background-run attachment, reopening,
+progress completion and error display; TypeScript check and production build.
+
+Update through BRAT and reload Obsidian to activate version 0.1.5.
