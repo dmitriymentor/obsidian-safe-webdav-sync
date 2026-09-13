@@ -39,23 +39,29 @@ async function walk(dir: string): Promise<string[]> {
 const planned = [];
 for (const file of await walk(vault)) {
   const original = await fs.readFile(file, "utf8");
-  if (!original.includes("<<<<<<< ЛОКАЛЬНАЯ ВЕРСИЯ")) continue;
-  const repair = repairLegacyConflicts(original);
   const relative = path.relative(vault, file);
+  const backup = path.join(backupDir, relative);
+  let saved: string | undefined;
+  try { saved = await fs.readFile(backup, "utf8"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  if (!original.includes("<<<<<<< ЛОКАЛЬНАЯ ВЕРСИЯ") && saved === undefined) continue;
+  const repair = repairLegacyConflicts(saved ?? original);
+  const alreadyRepaired = !original.includes("<<<<<<< ЛОКАЛЬНАЯ ВЕРСИЯ");
+  if (alreadyRepaired && original.trimEnd() !== repair.text.trimEnd()) throw new Error(`Repaired note changed: ${relative}`);
   const encrypted = await crypt.encryptFileName(relative);
   const url = root + encrypted.split("/").map(encodeURIComponent).join("/");
   const response = await request(url);
   if (!response.ok) throw new Error(`GET failed: ${response.status}`);
   const remote = await crypt.decryptData(new Uint8Array(await response.arrayBuffer()));
-  if (hash(remote) !== hash(Buffer.from(original))) throw new Error(`Server has changed: ${relative}`);
+  if (hash(remote) !== hash(Buffer.from(original)) &&
+      Buffer.from(remote).toString("utf8").trimEnd() !== repair.text.trimEnd()) throw new Error(`Server has changed: ${relative}`);
   const etag = response.headers.get("etag");
   if (!etag || etag.startsWith("W/")) throw new Error("A strong ETag is required before repair");
-  const backup = path.join(backupDir, relative);
   await fs.mkdir(path.dirname(backup), { recursive: true });
-  try { await fs.copyFile(file, backup, 1); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await fs.readFile(backup, "utf8") !== original) throw error;
-  }
+  if (saved === undefined) await fs.copyFile(file, backup, 1);
+  else if (!alreadyRepaired && saved !== original) throw new Error(`Original differs from backup: ${relative}`);
+  if (alreadyRepaired && hash(remote) === hash(Buffer.from(original))) continue;
+  if (alreadyRepaired) repair.text = original;
   planned.push({ file, original, relative, url, etag, repair });
 }
 console.log(JSON.stringify({ prepared: planned.length, backupDir }));
@@ -72,12 +78,24 @@ for (const item of planned) {
   if (!verified.ok) throw new Error("Verification GET failed");
   const bytes = await crypt.decryptData(new Uint8Array(await verified.arrayBuffer()));
   if (hash(bytes) !== hash(Buffer.from(result))) throw new Error("Server verification mismatch");
-  patchFile(item.file, item.original, result);
+  if (item.original !== result) patchFile(item.file, item.original, result);
   for (let retry = 0; retry < 20; retry++) {
     if (await fs.readFile(item.file, "utf8") === result) break;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  if (await fs.readFile(item.file, "utf8") !== result) throw new Error("Local verification mismatch");
+  const actual = await fs.readFile(item.file, "utf8");
+  if (actual !== result) {
+    // apply_patch may preserve a terminal blank line. Accept only that narrow
+    // difference, then store exactly the verified local bytes on the server.
+    if (actual.trimEnd() !== result.trimEnd()) throw new Error("Local verification mismatch");
+    const etag = verified.headers.get("etag");
+    if (!etag || etag.startsWith("W/")) throw new Error("Strong verification ETag required");
+    const encryptedActual = await crypt.encryptData(new Uint8Array(Buffer.from(actual)), undefined);
+    const normalized = await request(item.url, { method: "PUT", headers: { "If-Match": etag }, body: encryptedActual as BodyInit });
+    if (!normalized.ok) throw new Error(`Conditional normalization stopped: ${normalized.status}`);
+    const check = await request(item.url);
+    if (!check.ok || hash(await crypt.decryptData(new Uint8Array(await check.arrayBuffer()))) !== hash(Buffer.from(actual))) throw new Error("Final byte verification failed");
+  }
   repaired++;
 }
 console.log(JSON.stringify({ repaired, ties: planned.reduce((n, item) => n + item.repair.ties, 0), verified: true }));
