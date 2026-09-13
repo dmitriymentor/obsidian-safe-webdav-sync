@@ -3,6 +3,9 @@ import { RcloneCrypto } from "./crypto";
 import { mergeMarkdown, type MergeTimes } from "./merge";
 import type { FileState, ImportedConfig, RemoteEntry, SyncProgress, SyncSummary } from "./types";
 import { WebDav, type RawRemoteEntry } from "./webdav";
+import { DeletionJournal, JOURNAL, deletionConflicts, needsMassConfirmation, userPath } from "./deletions";
+import { backupRunId } from "./backups";
+import type { DeletionHooks, DeleteIntent } from "./types";
 
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
 const textEncoder = new TextEncoder();
@@ -16,7 +19,7 @@ function isMarkdown(path: string): boolean {
 
 function shouldSkip(path: string): boolean {
   const p = path.replace(/^\/+/, "");
-  return p.startsWith(".obsidian/") || p.startsWith(`${LOCAL_BACKUPS}/`) || p.startsWith(SAFETY_PREFIX);
+  return !userPath(p);
 }
 
 export async function hashBuffer(data: ArrayBuffer): Promise<string> {
@@ -44,13 +47,17 @@ export class SyncEngine {
   private readonly state: Record<string, FileState>;
   private readonly saveState: () => Promise<void>;
   private readonly onProgress?: (progress: SyncProgress) => void;
+  private readonly runId = backupRunId();
+  private journalPaths: string[] = [];
+  private journal?: DeletionJournal;
 
   constructor(
     app: App,
     config: ImportedConfig,
     state: Record<string, FileState>,
     saveState: () => Promise<void>,
-    onProgress?: (progress: SyncProgress) => void
+    onProgress?: (progress: SyncProgress) => void,
+    private readonly deletionHooks?: DeletionHooks
   ) {
     this.app = app;
     this.config = config;
@@ -84,24 +91,68 @@ export class SyncEngine {
     }
     this.progress("remote", "Получаю список с сервера", 0, 1);
     const remote = await this.readRemoteIndex();
+    if (this.deletionHooks) {
+      this.journal = new DeletionJournal(this.webdav, this.crypt, this.deletionHooks.data);
+      await this.journal.load(this.journalPaths);
+      if (!dryRun) { this.journal.remember(); await this.saveState(); }
+    }
     this.progress("remote", "Список с сервера получен", 1, 1);
     const expectedRemoteCount = Object.values(this.state).filter((item) => item.existsRemote).length;
-    if (expectedRemoteCount >= 10 && remote.size < expectedRemoteCount * 0.5) {
+    const acknowledgedDeletions = this.journal?.active.size ?? 0;
+    if (expectedRemoteCount >= 10 && remote.size + acknowledgedDeletions < expectedRemoteCount * 0.5) {
       throw new Error(
         `Защитная остановка: сервер вернул только ${remote.size} из ожидаемых ${expectedRemoteCount} файлов. Локальные файлы не изменены.`
       );
     }
-    const paths = [...new Set([...local.keys(), ...remote.keys(), ...Object.keys(this.state)])].sort();
+    const pending = [...(this.deletionHooks?.data.pending ?? [])];
+    const deletionPaths = [...new Set([...pending.map(p => p.path), ...(this.journal?.active.keys() ?? [])])];
+    const effectiveDeletions = deletionPaths.filter(p => local.has(p) || remote.has(p));
+    if (needsMassConfirmation(effectiveDeletions.length, Math.max(local.size, remote.size)) && !dryRun) {
+      if (!await this.deletionHooks?.confirmMass?.(effectiveDeletions)) {
+        throw new Error(`Ожидают подтверждения ${effectiveDeletions.length} удалений. Запустите синхронизацию вручную`);
+      }
+    }
+    const paths = [...new Set([...local.keys(), ...remote.keys(), ...Object.keys(this.state)])]
+      .filter(p => !deletionPaths.includes(p)).sort();
 
     for (let index = 0; index < paths.length; index++) {
       const path = paths[index]!;
       this.progress("files", "Синхронизирую файлы", index, paths.length, path);
       try {
+        if (this.deletionHooks?.data.pending.some(intent => intent.path === path)) continue;
         await this.syncOne(path, local.get(path), remote.get(path), dryRun, summary);
       } catch (error) {
         summary.errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
       }
       this.progress("files", "Синхронизирую файлы", index + 1, paths.length, path);
+    }
+    for (const path of deletionPaths) {
+      this.progress("files", "Проверяю удаление", 0, 0, path);
+      try {
+        const intent = pending.find(p => p.path === path);
+        if (intent && !dryRun) {
+          // A local re-creation cancels an unpublished event. A rename is
+          // published only after its destination has reached the server.
+          if (this.app.vault.getAbstractFileByPath(path)) {
+            this.deletionHooks!.data.pending = this.deletionHooks!.data.pending.filter(p => p.id !== intent.id);
+            await this.saveState();
+            continue;
+          }
+          if (intent.renameTo) {
+            const target = this.app.vault.getAbstractFileByPath(intent.renameTo);
+            const object = await this.webdav.getObject(await this.crypt.encryptPath(intent.renameTo));
+            if (!(target instanceof TFile) || !object ||
+                await hashBuffer(await this.crypt.decrypt(object.bytes)) !== await hashBuffer(await this.app.vault.readBinary(target))) {
+              throw new Error("Переименование ожидает загрузки нового пути; старый файл на сервере сохранён");
+            }
+          }
+          await this.journal!.publish(intent);
+          this.deletionHooks!.data.pending = this.deletionHooks!.data.pending.filter(p => p.id !== intent.id);
+          await this.saveState();
+        }
+        const intents = this.journal?.active.get(path) ?? (intent ? [intent] : []);
+        if (intents.length) await this.applyDeletion(path, intents, dryRun, summary);
+      } catch (error) { summary.errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`); }
     }
     if (!dryRun) {
       this.progress("saving", "Сохраняю индекс синхронизации", 0, 1);
@@ -123,10 +174,15 @@ export class SyncEngine {
 
   private async readRemoteIndex(): Promise<Map<string, RemoteEntry>> {
     const index = new Map<string, RemoteEntry>();
+    this.journalPaths = [];
     for (const raw of await this.webdav.list((completed, total) =>
-      this.progress("remote", "Читаю папки сервера", completed, total))) {
+      this.progress("remote", "Читаю папки сервера", completed, total), async encryptedPath => {
+        const path = (await this.crypt.decryptPath(encryptedPath)).replace(/\/+$/, "") + "/";
+        return !path.startsWith(SAFETY_PREFIX) && !path.startsWith(`${LOCAL_BACKUPS}/`) && !path.startsWith(".obsidian/");
+      })) {
       try {
         const path = (await this.crypt.decryptPath(raw.encryptedPath)).replace(/^\/+/, "").replace(/\/+$/, "");
+        if (!raw.isDirectory && path.startsWith(JOURNAL)) this.journalPaths.push(path);
         if (!path || raw.isDirectory || shouldSkip(path)) continue;
         index.set(path, { path, encryptedPath: raw.encryptedPath, isDirectory: false,
           size: raw.size, mtime: raw.mtime, etag: fingerprint(raw) });
@@ -155,7 +211,7 @@ export class SyncEngine {
   ): Promise<void> {
     const previous = this.state[path];
     if (!local && !remote) {
-      delete this.state[path];
+      if (!dryRun) delete this.state[path];
       return;
     }
     if (!previous) {
@@ -290,6 +346,7 @@ export class SyncEngine {
   }
 
   private async writeLocal(path: string, bytes: ArrayBuffer): Promise<void> {
+    if (this.deletionHooks?.data.pending.some(intent => intent.path === path)) throw new Error("Файл удалён пользователем во время синхронизации; ожидает обработки удаления");
     await this.ensureLocalFolder(path);
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) await this.app.vault.modifyBinary(existing, bytes);
@@ -297,11 +354,106 @@ export class SyncEngine {
   }
 
   private async backupBoth(path: string, local: ArrayBuffer, remote: ArrayBuffer): Promise<void> {
-    const stamp = safeTimestamp();
-    await this.writeLocal(`${LOCAL_BACKUPS}/${stamp}-конфликт/Локальная/${path}`, local);
-    await this.writeLocal(`${LOCAL_BACKUPS}/${stamp}-конфликт/Сервер/${path}`, remote);
-    await this.upload(`${SAFETY_PREFIX}${stamp}/local/${path}`, local);
-    await this.upload(`${SAFETY_PREFIX}${stamp}/remote/${path}`, remote);
+    await this.writeLocal(`${LOCAL_BACKUPS}/${this.runId}/Конфликты/Локальная/${path}`, local);
+    await this.writeLocal(`${LOCAL_BACKUPS}/${this.runId}/Конфликты/Сервер/${path}`, remote);
+    await this.upload(`${SAFETY_PREFIX}${this.runId}/local/${path}`, local);
+    await this.upload(`${SAFETY_PREFIX}${this.runId}/remote/${path}`, remote);
+  }
+
+  private async applyDeletion(path: string, intents: DeleteIntent[], dryRun: boolean, summary: SyncSummary): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    const local = file instanceof TFile ? await this.app.vault.readBinary(file) : undefined;
+    const encryptedPath = await this.crypt.encryptPath(path);
+    const object = await this.webdav.getObject(encryptedPath);
+    const remote = object ? await this.crypt.decrypt(object.bytes) : undefined;
+    const lhash = local ? await hashBuffer(local) : undefined;
+    const rhash = remote ? await hashBuffer(remote) : undefined;
+    const conflict = deletionConflicts([lhash, rhash], intents);
+    if (dryRun) {
+      if (conflict) summary.conflicts++; else if (local || remote) summary.deleted++;
+      return;
+    }
+    if (conflict) {
+      summary.conflicts++;
+      if (local) await this.archiveDeleted(path, local, "Локальная");
+      if (remote) await this.archiveDeleted(path, remote, "Сервер");
+      const decision = await this.deletionHooks?.resolveConflict?.(path) ?? "later";
+      if (decision === "later") throw new Error("Удаление конфликтует с правками. Версии сохранены; запустите вручную для выбора");
+      if (decision === "keep") {
+        await this.journal!.keep(intents);
+        await this.saveState();
+        // Do not merge or overwrite here. The next normal sync sees the
+        // canceled tombstone and reconciles the preserved files normally.
+        return;
+      }
+      // Record exactly the versions the user approved, never an unknown edit.
+      for (const hash of new Set([lhash, rhash].filter((h): h is string => Boolean(h)))) {
+        await this.journal!.publish({ id: crypto.randomUUID(), deviceId: this.deletionHooks!.data.deviceId,
+          path, baseHash: hash, createdAt: new Date().toISOString() });
+      }
+      await this.saveState();
+    }
+    if (remote) await this.archiveDeleted(path, remote, "Сервер");
+    if (local) await this.archiveDeleted(path, local, "Локальная");
+    // Re-read the operation cancellations immediately before side effects.
+    for (const intent of intents) {
+      if (await this.webdav.getObject(await this.crypt.encryptPath(`${JOURNAL}keep-${intent.id}.json`))) {
+        throw new Error("Удаление отменено другим устройством; повторите синхронизацию");
+      }
+    }
+    if (object) await this.webdav.removeIfMatch(encryptedPath, object.etag);
+    if (file instanceof TFile && local) {
+      if (this.app.vault.getAbstractFileByPath(path) !== file || await hashBuffer(await this.app.vault.readBinary(file)) !== lhash) {
+        throw new Error("Файл изменён во время удаления. Локальная версия сохранена");
+      }
+      const destination = `${LOCAL_BACKUPS}/${this.runId}/Удалённые/Оригиналы/${path}`;
+      await this.ensureLocalFolder(destination);
+      this.deletionHooks!.mutations.add(path);
+      try { await this.app.vault.rename(file, destination); }
+      finally { this.deletionHooks!.mutations.delete(path); }
+    }
+    delete this.state[path];
+    await this.saveState();
+    if (local || remote) summary.deleted++;
+  }
+
+  private async archiveDeleted(path: string, bytes: ArrayBuffer, side: string): Promise<void> {
+    const hash = await hashBuffer(bytes);
+    // Content-addressed versions allow safe retry without replacing a backup.
+    const backup = `${SAFETY_PREFIX}Удалённые/${hash}/${path}`;
+    const encrypted = await this.crypt.encryptPath(backup);
+    const existing = await this.webdav.getObject(encrypted);
+    if (!existing) await this.webdav.put(encrypted, await this.crypt.encrypt(bytes), { "If-None-Match": "*" });
+    if (await hashBuffer(await this.crypt.decrypt(await this.webdav.get(encrypted))) !== hash) throw new Error("Бекап удаления не прошёл проверку");
+    await this.writeLocal(`${LOCAL_BACKUPS}/${this.runId}/Удалённые/${side}/${path}`, bytes);
+  }
+
+  async deletedPaths(): Promise<string[]> {
+    if (!this.deletionHooks) return [];
+    await this.readRemoteIndex();
+    this.journal = new DeletionJournal(this.webdav, this.crypt, this.deletionHooks.data);
+    await this.journal.load(this.journalPaths);
+    return [...this.journal.active.keys()].sort();
+  }
+
+  async restoreDeleted(path: string): Promise<void> {
+    await this.deletedPaths();
+    const intents = this.journal!.active.get(path);
+    if (!intents?.length) throw new Error("Запись об удалении не найдена");
+    if (this.app.vault.getAbstractFileByPath(path)) throw new Error("Файл с таким путём уже есть. Восстановление не будет его перезаписывать");
+    let bytes: ArrayBuffer | undefined;
+    for (const intent of [...intents].sort((a, b) => b.createdAt.localeCompare(a.createdAt))) {
+      const object = await this.webdav.getObject(await this.crypt.encryptPath(`${SAFETY_PREFIX}Удалённые/${intent.baseHash}/${path}`));
+      if (!object) continue;
+      const candidate = await this.crypt.decrypt(object.bytes);
+      if (await hashBuffer(candidate) !== intent.baseHash) throw new Error("Резервная копия не прошла проверку");
+      bytes = candidate; break;
+    }
+    if (!bytes) throw new Error("Копия ещё не загружена в корзину сервера. Проверьте локальные бекапы исходного устройства");
+    await this.ensureLocalFolder(path);
+    await this.app.vault.createBinary(path, bytes);
+    await this.journal!.keep(intents);
+    await this.saveState();
   }
 
 }

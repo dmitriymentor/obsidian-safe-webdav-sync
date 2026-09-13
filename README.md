@@ -24,8 +24,28 @@ publishing credentials.
   Existing conflict markers are not rewritten automatically by sync. The
   separate repair utility requires preserved original dates and makes backups
   before conditional, verified WebDAV writes.
-- Missing files are restored from the other side. Automatic deletion is
-  intentionally disabled until durable cross-device tombstones are available.
+- Missing files alone never cause cross-device deletion. Version 0.2.0 adds
+  opt-in deletion events after a successful baseline sync. Update every device
+  first, then enable "Синхронизировать удаление файлов" on each device.
+- Observed delete/rename events are saved locally before publication as immutable,
+  encrypted journal records. A deletion refers to a path and observed SHA-256
+  revision, not a wall-clock winner. An edited file is preserved until the user
+  chooses keep/delete in a manual run. Background runs never decide this conflict.
+- Deletion creates verified encrypted archives before conditional WebDAV DELETE
+  with a strong ETag. Local originals move into the recoverable backup tree.
+  Ten files, or at least two exceeding 20% of the vault, require confirmation.
+  Renames upload the destination first; concurrent edits to the old path remain
+  a conflict rather than being silently erased.
+- Tombstones and explicit cancellation records never expire automatically. Known
+  journal entries disappearing abort sync. "Восстановить удалённый файл" restores
+  a verified server archive without overwriting an existing local note, then
+  cancels the observed deletions. Run sync afterwards to distribute the restore.
+- This tracks events observed while Obsidian and the plugin are running, not
+  deletions performed while the app was closed. Previously missing files are not
+  retroactively deleted. All clients must use 0.2.0 before enabling deletion;
+  older clients cannot honor its journal. Unknown re-creations at a deleted path
+  require conflict resolution or explicit restore. File and archive retention
+  is indefinite; there is no automatic permanent purge or device-expiry shortcut.
 - A mass-change guard aborts the run if WebDAV suddenly returns less than half
   of the previously indexed remote files.
 - Non-text conflicts keep both versions instead of silently choosing one.
@@ -37,6 +57,12 @@ publishing credentials.
   second run. Closing and reopening the window keeps the current progress.
   While the server is being scanned, an indeterminate indicator and the number
   of scanned folders are shown; 100% is displayed only after completion.
+- New backups share a date/run directory, subdivided into conflicts and deleted
+  files with original paths. Old one-file timestamp directories are grouped by
+  date after a successful sync, or via "Сгруппировать старые бекапы". Timestamp
+  suffixes preserve every distinct old version; occupied destinations are skipped,
+  and only empty old directories are removed. Internal server archive directories
+  are excluded from normal traversal; encrypted backup contents remain retained.
 
 ## Installation
 

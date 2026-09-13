@@ -11,6 +11,7 @@ export interface ImportedConfig {
 }
 
 export interface PluginSettings {
+  syncDeletions: boolean;
   autoSync: boolean;
   syncOnSave: boolean;
   intervalMs: number;
@@ -28,8 +29,32 @@ export interface FileState {
 }
 
 export interface PersistedData {
+  deletionState?: DeletionState;
   settings: PluginSettings;
   state: Record<string, FileState>;
+}
+
+export interface DeleteIntent {
+  id: string;
+  path: string;
+  baseHash: string;
+  createdAt: string;
+  deviceId: string;
+  renameTo?: string;
+}
+
+export interface DeletionState {
+  deviceId: string;
+  pending: DeleteIntent[];
+  knownIds: string[];
+  baselineReady: boolean;
+}
+
+export interface DeletionHooks {
+  data: DeletionState;
+  mutations: Set<string>;
+  confirmMass?: (paths: string[]) => Promise<boolean>;
+  resolveConflict?: (path: string) => Promise<"keep" | "delete" | "later">;
 }
 
 export interface RemoteEntry {

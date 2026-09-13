@@ -46,7 +46,7 @@ export class WebDav {
       url,
       method,
       body,
-      headers: { Authorization: this.auth, ...headers },
+      headers: { Authorization: this.auth, "Accept-Encoding": "identity", ...headers },
       throw: false
     });
     if (response.status < 200 || response.status >= 300) {
@@ -62,7 +62,8 @@ export class WebDav {
     });
   }
 
-  async list(onProgress?: (completed: number, total: number) => void): Promise<RawRemoteEntry[]> {
+  async list(onProgress?: (completed: number, total: number) => void,
+    includeDirectory?: (encryptedPath: string) => Promise<boolean>): Promise<RawRemoteEntry[]> {
     const found = new Map<string, RawRemoteEntry>();
     const queue = [""];
     const visited = new Set<string>();
@@ -75,6 +76,9 @@ export class WebDav {
         "Content-Type": "application/xml; charset=utf-8"
       });
       const doc = new DOMParser().parseFromString(response.text, "application/xml");
+      if (doc.getElementsByTagName("parsererror").length || !doc.getElementsByTagNameNS("*", "multistatus").length) {
+        throw new Error("Некорректный список WebDAV — синхронизация остановлена");
+      }
       const rows = Array.from(doc.getElementsByTagNameNS("*", "response"));
       for (const row of rows) {
         const href = xmlText(row, "href");
@@ -94,7 +98,7 @@ export class WebDav {
           etag: xmlText(row, "getetag")
         };
         found.set(relative, entry);
-        if (isDirectory) queue.push(relative);
+        if (isDirectory && (!includeDirectory || await includeDirectory(relative))) queue.push(relative);
       }
       onProgress?.(visited.size, visited.size + queue.length);
     }
@@ -103,6 +107,26 @@ export class WebDav {
 
   async get(encryptedPath: string): Promise<ArrayBuffer> {
     return (await this.request("GET", this.url(encryptedPath))).arrayBuffer;
+  }
+
+  async getObject(encryptedPath: string, retryWeak = true): Promise<{ bytes: ArrayBuffer; etag: string } | undefined> {
+    const response = await requestUrl({ url: this.url(encryptedPath), method: "GET", headers: { Authorization: this.auth, "Accept-Encoding": "identity" }, throw: false });
+    if (response.status === 404) return undefined;
+    if (response.status !== 200) throw new Error(`WebDAV GET: HTTP ${response.status}`);
+    const etag = response.headers.etag ?? response.headers.ETag ?? "";
+    // Apache can emit a weak validator during the first second after a write.
+    // Re-read the bytes as well as the validator; never strip W/ and pretend.
+    if (retryWeak && etag.startsWith("W/")) {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      return this.getObject(encryptedPath, false);
+    }
+    return { bytes: response.arrayBuffer, etag };
+  }
+
+  async removeIfMatch(encryptedPath: string, etag: string): Promise<void> {
+    if (!etag.startsWith('"') || etag.startsWith("W/")) throw new Error("Удаление требует надёжного ETag сервера");
+    const response = await requestUrl({ url: this.url(encryptedPath), method: "DELETE", headers: { Authorization: this.auth, "If-Match": etag }, throw: false });
+    if (![200, 204, 404].includes(response.status)) throw new Error(`WebDAV DELETE: HTTP ${response.status}; файл не удалён`);
   }
 
   async ensureParents(encryptedPath: string): Promise<void> {
@@ -123,10 +147,10 @@ export class WebDav {
     }
   }
 
-  async put(encryptedPath: string, data: ArrayBuffer): Promise<string> {
+  async put(encryptedPath: string, data: ArrayBuffer, conditions: Record<string, string> = {}): Promise<string> {
     await this.ensureParents(encryptedPath);
     const response = await this.request("PUT", this.url(encryptedPath), data, {
-      "Content-Type": "application/octet-stream"
+      "Content-Type": "application/octet-stream", ...conditions
     });
     return response.headers.etag ?? response.headers.ETag ?? "";
   }

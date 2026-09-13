@@ -20,7 +20,7 @@ class Modal {
   close() { (this as any).onClose(); }
 }
 class TFile { constructor(public path: string) {} }
-const obsidian = { Modal, TFile, normalizePath: (p: string) => p,
+const obsidian = { Modal, TFile, FuzzySuggestModal: Modal, TFolder: class {}, normalizePath: (p: string) => p,
   Plugin: class {}, PluginSettingTab: class {}, Notice: class {},
   Setting: class { addButton(callback: any) { const b: any = { setCta: () => b, setButtonText: () => b, onClick: () => b }; callback(b); } } };
 const runtime = (entry: string) => {
@@ -32,6 +32,139 @@ const runtime = (entry: string) => {
   return module.exports;
 };
 const Plugin = runtime("src/main.ts").default;
+const { legacyBackupTarget, groupLegacyBackups } = runtime("src/backups.ts");
+const { SyncEngine } = runtime("src/sync.ts");
+const buffer = (s: string) => new TextEncoder().encode(s).buffer;
+const digest = async (b: ArrayBuffer) => Buffer.from(await webcrypto.subtle.digest("SHA-256", b)).toString("hex");
+async function deletionFixture() {
+  const file = new TFile("note.md");
+  const original = buffer("old content");
+  const files = new Map([[file.path, { file, bytes: original }]]);
+  const remote = new Map([[file.path, { bytes: original, etag: '"v1"' }]]);
+  const deletes: string[] = [];
+  const state: any = { "note.md": { baseHash: await digest(original) } };
+  const engine: any = Object.create(SyncEngine.prototype);
+  Object.assign(engine, { runId: "test-run", state, saveState: async () => {},
+    deletionHooks: { data: { deviceId: "test-device" }, mutations: new Set() },
+    crypt: { encryptPath: async (p: string) => p, encrypt: async (b: ArrayBuffer) => b, decrypt: async (b: ArrayBuffer) => b },
+    webdav: {
+      get: async (p: string) => remote.get(p)!.bytes,
+      getObject: async (p: string) => remote.get(p),
+      put: async (p: string, bytes: ArrayBuffer) => { remote.set(p, { bytes, etag: '"backup"' }); return '"backup"'; },
+      removeIfMatch: async (p: string, etag: string) => {
+        if (remote.get(p)?.etag !== etag) throw Error("412"); deletes.push(p); remote.delete(p);
+      }
+    }, app: { vault: {
+      getAbstractFileByPath: (p: string) => files.get(p)?.file ?? null,
+      readBinary: async (f: TFile) => files.get(f.path)!.bytes,
+      modifyBinary: async (f: TFile, bytes: ArrayBuffer) => files.set(f.path, { file: f, bytes }),
+      createBinary: async (p: string, bytes: ArrayBuffer) => files.set(p, { file: new TFile(p), bytes }),
+      createFolder: async () => {}, adapter: { exists: async () => true },
+      rename: async (f: TFile, p: string) => { const value = files.get(f.path)!; files.delete(f.path); f.path = p; files.set(p, value); }
+    } } });
+  const intent = { id: "id", path: "note.md", baseHash: await digest(original) };
+  return { engine, files, remote, deletes, state, intent, summary: { deleted: 0, conflicts: 0 } };
+}
+
+test("deletion archives verified copies before removing only the unchanged revision", async () => {
+  const f = await deletionFixture();
+  f.engine.deletionHooks.data.pending = [];
+  await f.engine.applyDeletion("note.md", [f.intent], false, f.summary);
+  assert.equal(f.files.has("note.md"), false);
+  assert.equal(f.remote.has("note.md"), false);
+  assert.equal(f.deletes.length, 1);
+  assert.equal(f.summary.deleted, 1);
+  assert.ok([...f.files.keys()].some(p => p.includes("/Удалённые/Оригиналы/note.md")));
+  assert.ok([...f.remote.keys()].some(p => p.startsWith(".safe-sync-safety/Удалённые/")));
+});
+
+test("delete-versus-edit does not delete either side without a decision", async () => {
+  const f = await deletionFixture();
+  f.engine.deletionHooks.data.pending = [];
+  f.files.get("note.md")!.bytes = buffer("new unsynced edit");
+  await assert.rejects(f.engine.applyDeletion("note.md", [f.intent], false, f.summary), /конфликтует/);
+  assert.equal(f.files.has("note.md"), true);
+  assert.equal(f.deletes.length, 0);
+});
+
+test("a concurrent server change rejects deletion and leaves local content intact", async () => {
+  const f = await deletionFixture();
+  f.engine.deletionHooks.data.pending = [];
+  f.engine.webdav.removeIfMatch = async () => { throw Error("412"); };
+  await assert.rejects(f.engine.applyDeletion("note.md", [f.intent], false, f.summary), /412/);
+  assert.equal(f.files.has("note.md"), true);
+  assert.ok(f.state["note.md"]);
+});
+
+test("dry-run deletion neither creates backups nor removes files", async () => {
+  const f = await deletionFixture();
+  await f.engine.applyDeletion("note.md", [f.intent], true, f.summary);
+  assert.equal(f.files.size, 1);
+  assert.equal(f.remote.size, 1);
+  assert.equal(f.deletes.length, 0);
+});
+
+test("restore reads the verified archived revision and never overwrites an existing note", async () => {
+  const f = await deletionFixture();
+  const original = f.files.get("note.md")!.bytes;
+  let canceled = false;
+  f.engine.journal = { active: new Map([["note.md", [{ ...f.intent, createdAt: "2026-09-13" }]]]), keep: async () => { canceled = true; } };
+  f.engine.deletedPaths = async () => ["note.md"];
+  await assert.rejects(f.engine.restoreDeleted("note.md"), /уже есть/);
+  assert.equal(canceled, false);
+  f.files.delete("note.md");
+  f.remote.set(`.safe-sync-safety/Удалённые/${f.intent.baseHash}/note.md`, { bytes: original, etag: '"archive"' });
+  await f.engine.restoreDeleted("note.md");
+  assert.equal(await digest(f.files.get("note.md")!.bytes), f.intent.baseHash);
+  assert.equal(canceled, true);
+});
+
+test("legacy grouping preserves file objects and skips any occupied destination", async () => {
+  const old = "Safe Sync Backups/2026-09-08T12-14-47-284Z-конфликт/Локальная/Base/note.md";
+  const old2 = old.replace("284Z", "285Z");
+  const one: any = new TFile(old), two: any = new TFile(old2);
+  const files = new Map([[old, one], [old2, two], [legacyBackupTarget(old2), new TFile(legacyBackupTarget(old2))]]);
+  let moved = 0;
+  const app = { vault: {
+    getFiles: () => [...files.values()],
+    getAbstractFileByPath: (p: string) => files.get(p) ?? null,
+    adapter: { exists: async () => true },
+    rename: async (file: any, p: string) => { assert.equal(files.has(p), false); files.delete(file.path); file.path = p; files.set(p, file); moved++; }
+  } };
+  assert.equal(await groupLegacyBackups(app), 1);
+  assert.equal(files.get(legacyBackupTarget(old)), one);
+  assert.equal(files.get(old2), two);
+  assert.equal(moved, 1);
+});
+
+test("capture only records new observed deletion events after opt-in and baseline; folder rename keeps destinations", async () => {
+  const plugin = new Plugin();
+  plugin.ready = true;
+  plugin.sourcePluginEnabled = () => false;
+  plugin.persist = async () => {};
+  plugin.data = { settings: { syncDeletions: false, syncOnSave: false },
+    deletionState: { deviceId: "device", pending: [], baselineReady: true },
+    state: { "Base/a.md": { existsRemote: true, baseHash: "a".repeat(64) },
+      "Base/b.md": { existsRemote: true, baseHash: "b".repeat(64) } } };
+  await plugin.captureDeletion("Base/a.md");
+  assert.equal(plugin.data.deletionState.pending.length, 0);
+  plugin.data.settings.syncDeletions = true;
+  await plugin.captureDeletion("Base", { path: "Renamed" });
+  assert.equal(plugin.data.deletionState.pending.length, 2);
+  assert.equal(plugin.data.deletionState.pending[0].renameTo, "Renamed/a.md");
+  await plugin.captureDeletion("Base");
+  assert.equal(plugin.data.deletionState.pending.length, 2);
+  await plugin.captureDeletion("Safe Sync Backups/old.md");
+  assert.equal(plugin.data.deletionState.pending.length, 2);
+});
+
+test("old backup grouping retains paths and distinguishes versions without single-file directories", () => {
+  const target = legacyBackupTarget("Safe Sync Backups/2026-09-08T12-14-47-284Z-конфликт/Локальная/Base/note.md");
+  assert.equal(target, "Safe Sync Backups/Архив/2026-09-08/Конфликты/Локальная/Base/note [12-14-47-284Z-конфликт].md");
+  assert.notEqual(target, legacyBackupTarget("Safe Sync Backups/2026-09-08T12-14-47-285Z-конфликт/Локальная/Base/note.md"));
+  assert.equal(legacyBackupTarget(target), undefined);
+  assert.equal(legacyBackupTarget("Safe Sync Backups/2026-09-13/Запуск 10-00-00-123-abc/Конфликты/Локальная/note.md"), undefined);
+});
 test("pressing sync during a background run opens live progress and can reopen it", async () => {
   const plugin = new Plugin();
   plugin.app = {};

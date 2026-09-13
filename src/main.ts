@@ -1,9 +1,12 @@
-import { Modal, Notice, Plugin, PluginSettingTab, Setting, type App } from "obsidian";
+import { Modal, Notice, Plugin, PluginSettingTab, Setting, FuzzySuggestModal, TFile, type TAbstractFile, type App } from "obsidian";
 import { importRemotelySaveConfig } from "./import-config";
 import { SyncEngine } from "./sync";
 import type { PersistedData, PluginSettings, SyncProgress, SyncSummary } from "./types";
+import { userPath } from "./deletions";
+import { groupLegacyBackups } from "./backups";
 
 const DEFAULT_SETTINGS: PluginSettings = {
+  syncDeletions: false,
   autoSync: false,
   syncOnSave: true,
   intervalMs: 300000,
@@ -19,6 +22,9 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   private lastProgress: SyncProgress | undefined;
   private activeDryRun = false;
   private startedAt = 0;
+  private ready = false;
+  private mutations = new Set<string>();
+  private persistQueue: Promise<void> = Promise.resolve();
 
   private clearProgress(): void {
     this.progressModal?.close();
@@ -35,12 +41,17 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     const loaded = (await this.loadData()) as Partial<PersistedData> | null;
     this.data = {
       settings: { ...DEFAULT_SETTINGS, ...(loaded?.settings ?? {}) },
-      state: loaded?.state ?? {}
+      state: loaded?.state ?? {},
+      deletionState: loaded?.deletionState ?? { deviceId: crypto.randomUUID(), pending: [], knownIds: [], baselineReady: false }
     };
+    await this.persist();
+    this.app.workspace.onLayoutReady(() => { this.ready = true; });
     this.addRibbonIcon("refresh-cw", "Safe WebDAV Sync", () => void this.sync(false, "вручную"));
     this.addCommand({ id: "sync-now", name: "Синхронизировать сейчас", callback: () => void this.sync(false, "командой") });
     this.addCommand({ id: "dry-run", name: "Проверить план без изменений", callback: () => void this.sync(true, "проверка") });
     this.addCommand({ id: "test-connection", name: "Проверить WebDAV и шифрование", callback: () => void this.checkConnection() });
+    this.addCommand({ id: "restore-deleted", name: "Восстановить удалённый файл", callback: () => void this.restoreDeleted() });
+    this.addCommand({ id: "group-backups", name: "Сгруппировать старые бекапы", callback: () => void this.groupBackups() });
     this.statusEl = this.addStatusBarItem();
     this.statusEl.setText("Safe Sync: готов");
     this.addSettingTab(new SafeSyncSettingTab(this.app, this));
@@ -50,6 +61,8 @@ export default class SafeWebDavSyncPlugin extends Plugin {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = window.setTimeout(() => void this.sync(false, "после сохранения"), 1200);
     }));
+    this.registerEvent(this.app.vault.on("delete", (file) => { void this.captureDeletion(file.path); }));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => { void this.captureDeletion(oldPath, file); }));
     this.registerInterval(window.setInterval(() => {
       if (this.data.settings.autoSync && !this.sourcePluginEnabled()) void this.sync(false, "по расписанию");
     }, this.data.settings.intervalMs));
@@ -73,7 +86,70 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   }
 
   async persist(): Promise<void> {
-    await this.saveData(this.data);
+    const save = this.persistQueue.then(() => this.saveData(this.data));
+    this.persistQueue = save.catch(() => {});
+    await save;
+  }
+
+  private async captureDeletion(oldPath: string, renamed?: TAbstractFile): Promise<void> {
+    const data = this.data.deletionState!;
+    if (!this.ready || !this.data.settings.syncDeletions || !data.baselineReady || this.sourcePluginEnabled() ||
+        this.mutations.has(oldPath) || !userPath(oldPath)) return;
+    const entries = Object.entries(this.data.state).filter(([path]) => path === oldPath || path.startsWith(`${oldPath}/`));
+    for (const [path, state] of entries) {
+      if (!state.existsRemote || !state.baseHash || data.pending.some(p => p.path === path)) continue;
+      const renameTo = renamed ? renamed.path + path.slice(oldPath.length) : undefined;
+      // Moving into an excluded folder is not interpreted as a cross-device delete.
+      if (renameTo && !userPath(renameTo)) continue;
+      data.pending.push({ id: crypto.randomUUID(), deviceId: data.deviceId, path, baseHash: state.baseHash,
+        createdAt: new Date().toISOString(), ...(renameTo ? { renameTo } : {}) });
+    }
+    try {
+      await this.persist();
+      if (this.data.settings.syncOnSave && !this.running) {
+        window.clearTimeout(this.saveTimer);
+        this.saveTimer = window.setTimeout(() => void this.sync(false, "после удаления"), 1200);
+      }
+    } catch { new Notice("Не удалось сохранить операцию удаления. Не запускайте другие устройства до проверки", 15000); }
+  }
+
+  async groupBackups(): Promise<void> {
+    if (this.running) { new Notice("Дождитесь завершения синхронизации"); return; }
+    this.running = true;
+    try { new Notice(`Сгруппировано резервных файлов: ${await groupLegacyBackups(this.app)}`); }
+    catch (error) { new Notice(`Бекапы: ${message(error)}`, 12000); }
+    finally { this.running = false; }
+  }
+
+  private async createEngine(interactive: boolean, onProgress?: (progress: SyncProgress) => void): Promise<SyncEngine> {
+    const config = await importRemotelySaveConfig(this.app.vault.adapter, this.data.settings.sourcePluginId, this.app.vault.getName());
+    return new SyncEngine(this.app, config, this.data.state, () => this.persist(), onProgress, {
+      data: this.data.deletionState!, mutations: this.mutations,
+      confirmMass: interactive ? async (paths) => await choose(this.app, `Удалить ${paths.length} файлов на этом устройстве и сервере?`,
+        paths.slice(0, 15).join("\n") + (paths.length > 15 ? "\n…" : "") + "\nКопии будут сохранены в корзине.",
+        [{ value: "yes", label: "Подтвердить удаление" }, { value: "no", label: "Отмена" }], "no") === "yes" : undefined,
+      resolveConflict: interactive ? async (path) => choose(this.app, "Файл изменён после удаления на другом устройстве", path,
+        [{ value: "keep", label: "Сохранить файл — отменить удаление" },
+          { value: "delete", label: "Удалить, сохранив бекап" }, { value: "later", label: "Решить позже" }], "later") : undefined
+    });
+  }
+
+  async restoreDeleted(): Promise<void> {
+    if (this.running || this.sourcePluginEnabled()) { new Notice("Дождитесь синхронизации и выключите Remotely Save"); return; }
+    this.running = true;
+    try {
+      const engine = await this.createEngine(false);
+      const paths = await engine.deletedPaths();
+      if (!paths.length) { new Notice("В журнале нет удалённых файлов"); return; }
+      new DeletedFilePicker(this.app, paths, async path => {
+        if (this.running) { new Notice("Дождитесь завершения текущей операции"); return; }
+        this.running = true;
+        try { await engine.restoreDeleted(path); new Notice("Файл восстановлен. Запустите синхронизацию для отправки на остальные устройства", 10000); }
+        catch (error) { new Notice(message(error), 12000); }
+        finally { this.running = false; }
+      }).open();
+    } catch (error) { new Notice(message(error), 12000); }
+    finally { this.running = false; }
   }
 
   async checkConnection(): Promise<void> {
@@ -116,18 +192,18 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     try {
       // Yield once so the dialog paints before reading or encrypting files.
       await new Promise((resolve) => window.setTimeout(resolve, 0));
-      const config = await importRemotelySaveConfig(
-        this.app.vault.adapter,
-        this.data.settings.sourcePluginId,
-        this.app.vault.getName()
-      );
-      const engine = new SyncEngine(this.app, config, this.data.state, () => this.persist(), (progress) => {
+      const engine = await this.createEngine(interactive, (progress) => {
         this.lastProgress = progress;
         this.progressModal?.update(progress);
         const count = progress.total > 1 ? ` ${progress.completed}/${progress.total}` : "";
         this.statusEl?.setText(`Safe Sync: ${progress.label}${count}`);
       });
       const summary = await engine.run(dryRun);
+      if (!dryRun && summary.errors.length === 0) {
+        this.data.deletionState!.baselineReady = true;
+        await this.persist();
+        await groupLegacyBackups(this.app);
+      }
       const report = formatSummary(summary, dryRun);
       this.statusEl?.setText(summary.errors.length ? "Safe Sync: есть ошибки" : "Safe Sync: готов");
       this.progressModal?.finish(report, summary.errors);
@@ -286,6 +362,26 @@ class SafeSyncSettingTab extends PluginSettingTab {
       }));
 
     new Setting(containerEl)
+      .setName("Синхронизировать удаление файлов")
+      .setDesc("Включайте только после обновления ВСЕХ устройств до 0.2.0 и успешной синхронизации. Учитываются только новые события удаления и переименования, не прежнее отсутствие файлов.")
+      .addToggle(toggle => toggle.setValue(this.plugin.data.settings.syncDeletions).onChange(async value => {
+        if (value && (!this.plugin.data.deletionState?.baselineReady ||
+            await choose(this.app, "Все устройства обновлены?", "Старые версии не понимают журнал удалений и могут возвращать файлы. Сначала обновите все устройства до 0.2.0, выполните синхронизацию, затем включите этот переключатель на каждом устройстве.",
+              [{ value: "yes", label: "Да, все обновлены" }, { value: "no", label: "Пока нет" }], "no") !== "yes")) {
+          toggle.setValue(false); new Notice("Сначала обновите устройства и завершите синхронизацию"); return;
+        }
+        this.plugin.data.settings.syncDeletions = value;
+        await this.plugin.persist();
+      }));
+
+    new Setting(containerEl).setName("Корзина синхронизации")
+      .setDesc("Восстановление из зашифрованной копии. Существующий файл не перезаписывается.")
+      .addButton(button => button.setButtonText("Восстановить файл").onClick(() => void this.plugin.restoreDeleted()));
+    new Setting(containerEl).setName("Старые бекапы")
+      .setDesc("Группирует прежние однофайловые папки по дням, сохраняя все версии. Новые бекапы группируются по запуску.")
+      .addButton(button => button.setButtonText("Сгруппировать").onClick(() => void this.plugin.groupBackups()));
+
+    new Setting(containerEl)
       .setName("Синхронизировать после сохранения")
       .setDesc("Запуск через 1,2 секунды после изменения файла.")
       .addToggle((toggle) => toggle.setValue(this.plugin.data.settings.syncOnSave).onChange(async (value) => {
@@ -298,6 +394,33 @@ class SafeSyncSettingTab extends PluginSettingTab {
       text: "Правки сопоставляются с общей предыдущей версией по содержимому, с учётом смещения строк. Независимые изменения объединяются. При конфликте остаётся вариант из более новой заметки: сравниваются даты updated, иначе — время изменения файлов. При равных датах выбирается серверный вариант. Резервные копии сохраняются отдельно в Safe Sync Backups."
     });
   }
+}
+
+class DeletedFilePicker extends FuzzySuggestModal<string> {
+  constructor(app: App, private paths: string[], private selected: (path: string) => Promise<void>) {
+    super(app); this.setPlaceholder("Выберите удалённый файл для восстановления");
+  }
+  getItems() { return this.paths; }
+  getItemText(path: string) { return path; }
+  onChooseItem(path: string) { void this.selected(path); }
+}
+
+function choose<T extends string>(app: App, title: string, description: string,
+  choices: Array<{ value: T; label: string }>, cancel: T): Promise<T> {
+  return new Promise(resolve => {
+    let settled = false;
+    class ChoiceModal extends Modal {
+      onOpen() {
+        this.titleEl.setText(title);
+        this.contentEl.createEl("p", { text: description }).style.whiteSpace = "pre-wrap";
+        for (const choice of choices) new Setting(this.contentEl).addButton(button => button.setButtonText(choice.label).onClick(() => {
+          settled = true; resolve(choice.value); this.close();
+        }));
+      }
+      onClose() { if (!settled) resolve(cancel); }
+    }
+    new ChoiceModal(app).open();
+  });
 }
 
 function message(error: unknown): string {
