@@ -429,6 +429,6 @@ function message(error: unknown): string {
 
 function formatSummary(s: SyncSummary, dryRun: boolean): string {
   const prefix = dryRun ? "План" : "Готово";
-  const core = `${prefix}: ↑${s.uploaded} ↓${s.downloaded} объединено ${s.merged}, конфликтов ${s.conflicts}, удалено ${s.deleted}`;
+  const core = `${prefix}: ↑${s.uploaded} ↓${s.downloaded} объединено ${s.merged}, конфликтов ${s.conflicts}, удалено ${s.deleted}, очищено ${s.repaired ?? 0}`;
   return s.errors.length ? `${core}. Ошибок: ${s.errors.length}` : core;
 }

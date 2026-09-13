@@ -1,6 +1,7 @@
 import { normalizePath, TFile, type App } from "obsidian";
 import { RcloneCrypto } from "./crypto";
 import { mergeMarkdown, type MergeTimes } from "./merge";
+import { hasLegacyConflicts, planLegacyRepair, repairLegacyConflicts } from "./repair";
 import type { FileState, ImportedConfig, RemoteEntry, SyncProgress, SyncSummary } from "./types";
 import { WebDav, type RawRemoteEntry } from "./webdav";
 import { DeletionJournal, JOURNAL, deletionConflicts, needsMassConfirmation, userPath } from "./deletions";
@@ -77,7 +78,7 @@ export class SyncEngine {
   async run(dryRun = false): Promise<SyncSummary> {
     const summary: SyncSummary = {
       uploaded: 0, downloaded: 0, merged: 0, conflicts: 0,
-      deleted: 0, unchanged: 0, errors: []
+      deleted: 0, unchanged: 0, repaired: 0, errors: []
     };
     const local = new Map<string, { file: TFile; bytes: ArrayBuffer; hash: string; mtime: number }>();
     const localFiles = this.app.vault.getFiles().filter((file) => !shouldSkip(file.path));
@@ -210,6 +211,7 @@ export class SyncEngine {
     summary: SyncSummary
   ): Promise<void> {
     const previous = this.state[path];
+    if (isMarkdown(path) && await this.tryLegacyRepair(path, local, remote, previous, dryRun, summary)) return;
     if (!local && !remote) {
       if (!dryRun) delete this.state[path];
       return;
@@ -291,6 +293,67 @@ export class SyncEngine {
     }
   }
 
+  private async tryLegacyRepair(
+    path: string,
+    local: { file: TFile; bytes: ArrayBuffer; hash: string; mtime: number } | undefined,
+    remote: RemoteEntry | undefined,
+    previous: FileState | undefined,
+    dryRun: boolean,
+    summary: SyncSummary
+  ): Promise<boolean> {
+    const localText = local ? textDecoder.decode(local.bytes) : "";
+    const base = previous?.baseText ?? "";
+    if (!hasLegacyConflicts(localText) && !hasLegacyConflicts(base) &&
+        (!remote || (previous && remote.etag === previous.remoteFingerprint))) return false;
+    const encryptedPath = await this.crypt.encryptPath(path);
+    const object = await this.webdav.getObject(encryptedPath);
+    if (remote && !object) throw new Error("Файл изменился на сервере во время проверки старых конфликтов");
+    const remoteBytes = object ? await this.crypt.decrypt(object.bytes) : undefined;
+    const remoteText = remoteBytes ? textDecoder.decode(remoteBytes) : "";
+    if (![localText, base, remoteText].some(hasLegacyConflicts)) return false;
+    if (!local && !object) return false;
+    const repair = local && object
+      ? planLegacyRepair(localText, base, remoteText, { localMtime: local.mtime, remoteMtime: remote?.mtime ?? 0 })!
+      : { ...repairLegacyConflicts(local ? localText : remoteText), conflict: false };
+    const bytes = toArrayBuffer(textEncoder.encode(repair.text));
+    const hash = await hashBuffer(bytes);
+    if (!dryRun) {
+      this.progress("files", "Убираю старые конфликтные блоки", 0, 0, path);
+      const assertLocalUnchanged = async () => {
+        const current = this.app.vault.getAbstractFileByPath(path);
+        if (this.deletionHooks?.data.pending.some(intent => intent.path === path) ||
+            (local ? !(current instanceof TFile) || await hashBuffer(await this.app.vault.readBinary(current)) !== local.hash : current !== null)) {
+          throw new Error("Заметка изменена во время исправления — повторите синхронизацию");
+        }
+      };
+      await assertLocalUnchanged();
+      const changesLocal = !local || local.hash !== hash;
+      const changesRemote = !remoteBytes || await hashBuffer(remoteBytes) !== hash;
+      if (changesLocal || changesRemote) await this.backupBoth(path, local?.bytes, remoteBytes);
+      await assertLocalUnchanged();
+      if (changesRemote) {
+        if (object && (!object.etag.startsWith('"') || object.etag.startsWith("W/"))) {
+          throw new Error("Нет надёжного ETag для безопасного исправления");
+        }
+        await this.webdav.put(encryptedPath, await this.crypt.encrypt(bytes), object
+          ? { "If-Match": object.etag } : { "If-None-Match": "*" });
+      }
+      // Verify even when no upload was needed: another client may have written
+      // while we were creating the backups. Never install an unverified base.
+      const verified = await this.webdav.getObject(encryptedPath);
+      if (!verified || await hashBuffer(await this.crypt.decrypt(verified.bytes)) !== hash) {
+        throw new Error("Сервер изменился после исправления — локальная версия сохранена");
+      }
+      await assertLocalUnchanged();
+      if (changesLocal) await this.writeLocal(path, bytes);
+      this.state[path] = this.makeState(bytes, hash, verified.etag);
+      await this.saveState();
+    }
+    summary.repaired++;
+    if (repair.conflict) summary.conflicts++;
+    return true;
+  }
+
   private async resolveBothChanged(
     path: string,
     localBytes: ArrayBuffer,
@@ -353,11 +416,19 @@ export class SyncEngine {
     else await this.app.vault.createBinary(path, bytes);
   }
 
-  private async backupBoth(path: string, local: ArrayBuffer, remote: ArrayBuffer): Promise<void> {
-    await this.writeLocal(`${LOCAL_BACKUPS}/${this.runId}/Конфликты/Локальная/${path}`, local);
-    await this.writeLocal(`${LOCAL_BACKUPS}/${this.runId}/Конфликты/Сервер/${path}`, remote);
-    await this.upload(`${SAFETY_PREFIX}${this.runId}/local/${path}`, local);
-    await this.upload(`${SAFETY_PREFIX}${this.runId}/remote/${path}`, remote);
+  private async backupBoth(path: string, local?: ArrayBuffer, remote?: ArrayBuffer): Promise<void> {
+    for (const [label, side, bytes] of [["Локальная", "local", local], ["Сервер", "remote", remote]] as const) {
+      if (!bytes) continue;
+      const localPath = `${LOCAL_BACKUPS}/${this.runId}/Конфликты/${label}/${path}`;
+      await this.writeLocal(localPath, bytes);
+      const file = this.app.vault.getAbstractFileByPath(localPath);
+      const remotePath = `${SAFETY_PREFIX}${this.runId}/${side}/${path}`;
+      await this.upload(remotePath, bytes);
+      if (!(file instanceof TFile) || await hashBuffer(await this.app.vault.readBinary(file)) !== await hashBuffer(bytes) ||
+          await hashBuffer(await this.crypt.decrypt(await this.webdav.get(await this.crypt.encryptPath(remotePath)))) !== await hashBuffer(bytes)) {
+        throw new Error("Резервная копия не прошла проверку; оригиналы не изменены");
+      }
+    }
   }
 
   private async applyDeletion(path: string, intents: DeleteIntent[], dryRun: boolean, summary: SyncSummary): Promise<void> {

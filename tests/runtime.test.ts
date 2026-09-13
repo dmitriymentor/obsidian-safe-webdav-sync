@@ -66,6 +66,77 @@ async function deletionFixture() {
   return { engine, files, remote, deletes, state, intent, summary: { deleted: 0, conflicts: 0 } };
 }
 
+async function legacyFixture() {
+  const f = await deletionFixture();
+  const clean = "---\nupdated: 2026-09-13\n---\n- keep newest\n";
+  const old = clean.replace("2026-09-13", "2026-09-08").replace("newest", "oldest");
+  const dirty = `<<<<<<< ЛОКАЛЬНАЯ ВЕРСИЯ\n${clean}||||||| ПОСЛЕДНЯЯ ОБЩАЯ\n=======\n${old}>>>>>>> ВЕРСИЯ С СЕРВЕРА\n`;
+  f.files.get("note.md")!.bytes = buffer(dirty);
+  f.remote.get("note.md")!.bytes = buffer(clean);
+  Object.assign(f.state["note.md"], { baseText: dirty, baseHash: await digest(buffer(dirty)), remoteFingerprint: '"previous"' });
+  f.engine.deletionHooks.data.pending = [];
+  const local = { file: f.files.get("note.md")!.file, bytes: buffer(dirty), hash: await digest(buffer(dirty)), mtime: 10 };
+  const remote = { encryptedPath: "note.md", etag: '"v1"', mtime: 20 };
+  const summary = { repaired: 0, conflicts: 0 };
+  return { ...f, local, entry: remote, clean, dirty, summary };
+}
+
+test("migration repairs an old mobile base and saves only clean text on both sides", async () => {
+  const f = await legacyFixture();
+  assert.equal(await f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], false, f.summary), true);
+  assert.equal(new TextDecoder().decode(f.files.get("note.md")!.bytes), f.clean);
+  assert.equal(new TextDecoder().decode(f.remote.get("note.md")!.bytes), f.clean);
+  assert.equal(f.state["note.md"].baseText, f.clean);
+  assert.equal(f.summary.repaired, 1);
+  assert.equal(f.deletes.length, 0);
+  assert.ok([...f.files.keys()].some(p => p.includes("Конфликты/Локальная/note.md")));
+});
+
+test("migration dry run and malformed markers never mutate either side", async () => {
+  const f = await legacyFixture();
+  await f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], true, f.summary);
+  assert.equal(f.files.size, 1);
+  assert.equal(f.remote.size, 1);
+  assert.equal(new TextDecoder().decode(f.files.get("note.md")!.bytes), f.dirty);
+  f.local.bytes = buffer("<<<<<<< ЛОКАЛЬНАЯ ВЕРСИЯ\nincomplete\n");
+  await assert.rejects(f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], false, f.summary), /маркеры/);
+  assert.equal(f.files.size, 1);
+});
+
+test("migration observes a pending user deletion and does not resurrect the note", async () => {
+  const f = await legacyFixture();
+  f.engine.deletionHooks.data.pending = [{ path: "note.md" }];
+  await assert.rejects(f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], false, f.summary), /изменена/);
+  assert.equal(f.files.size, 1);
+  assert.equal(f.remote.size, 1);
+});
+
+test("migration uses the validator of the actual read and stops on conditional write failure", async () => {
+  const f = await legacyFixture();
+  f.remote.get("note.md")!.bytes = buffer(f.dirty);
+  f.remote.get("note.md")!.etag = '"fresh-read"';
+  const put = f.engine.webdav.put;
+  f.engine.webdav.put = async (p: string, b: ArrayBuffer, headers: any) => {
+    if (p === "note.md") { assert.equal(headers["If-Match"], '"fresh-read"'); throw Error("412"); }
+    return put(p, b);
+  };
+  await assert.rejects(f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], false, f.summary), /412/);
+  assert.equal(new TextDecoder().decode(f.files.get("note.md")!.bytes), f.dirty);
+  assert.equal(f.state["note.md"].baseText, f.dirty);
+});
+
+test("migration verifies the remote again even when the clean server needs no write", async () => {
+  const f = await legacyFixture();
+  const get = f.engine.webdav.getObject;
+  let reads = 0;
+  f.engine.webdav.getObject = async (p: string) => {
+    if (++reads > 1) return { bytes: buffer("concurrent edit"), etag: '"changed"' };
+    return get(p);
+  };
+  await assert.rejects(f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], false, f.summary), /Сервер изменился/);
+  assert.equal(new TextDecoder().decode(f.files.get("note.md")!.bytes), f.dirty);
+});
+
 test("deletion archives verified copies before removing only the unchanged revision", async () => {
   const f = await deletionFixture();
   f.engine.deletionHooks.data.pending = [];

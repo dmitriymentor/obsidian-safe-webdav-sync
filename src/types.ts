@@ -67,6 +67,7 @@ export interface RemoteEntry {
 }
 
 export interface SyncSummary {
+  repaired: number;
   uploaded: number;
   downloaded: number;
   merged: number;

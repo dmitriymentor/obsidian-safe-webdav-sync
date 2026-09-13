@@ -21,9 +21,16 @@ publishing credentials.
   Duplicate or simultaneously rewritten blocks cannot always be identified
   as moves. If both sides move the same recognized block to different places,
   the newer complete document wins to avoid duplicate copies of that block.
-  Existing conflict markers are not rewritten automatically by sync. The
-  separate repair utility requires preserved original dates and makes backups
-  before conditional, verified WebDAV writes.
+- Version 0.2.1 repairs legacy conflict markers before ordinary synchronization,
+  including nested conflicts and saved common bases from older clients. It uses
+  preserved branch dates; equal dates prefer the server. Undated fragments reuse
+  side-specific dates only when unambiguous at the same nesting level. Broken
+  or undated unequal blocks stop that note with an error, never a guessed repair.
+  A partial two-document conflict is repaired only when both documents match
+  apart from `updated`. Ordinary repeated lines outside conflicts are preserved.
+  Verified grouped local/server backups precede conditional repair writes;
+  concurrent changes stop the repair. The summary reports the cleaned count.
+  Update every device to 0.2.1 before syncing old affected notes.
 - Missing files alone never cause cross-device deletion. Version 0.2.0 adds
   opt-in deletion events after a successful baseline sync. Update every device
   first, then enable "Синхронизировать удаление файлов" on each device.
