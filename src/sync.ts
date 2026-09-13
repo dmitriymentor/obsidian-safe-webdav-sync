@@ -1,6 +1,6 @@
 import { normalizePath, TFile, type App } from "obsidian";
 import { RcloneCrypto } from "./crypto";
-import { mergeMarkdown } from "./merge";
+import { mergeMarkdown, type MergeTimes } from "./merge";
 import type { FileState, ImportedConfig, RemoteEntry, SyncProgress, SyncSummary } from "./types";
 import { WebDav, type RawRemoteEntry } from "./webdav";
 
@@ -72,14 +72,14 @@ export class SyncEngine {
       uploaded: 0, downloaded: 0, merged: 0, conflicts: 0,
       deleted: 0, unchanged: 0, errors: []
     };
-    const local = new Map<string, { file: TFile; bytes: ArrayBuffer; hash: string }>();
+    const local = new Map<string, { file: TFile; bytes: ArrayBuffer; hash: string; mtime: number }>();
     const localFiles = this.app.vault.getFiles().filter((file) => !shouldSkip(file.path));
     this.progress("local", "Читаю локальные файлы", 0, localFiles.length);
     for (let index = 0; index < localFiles.length; index++) {
       const file = localFiles[index]!;
       if (shouldSkip(file.path)) continue;
       const bytes = await this.app.vault.readBinary(file);
-      local.set(file.path, { file, bytes, hash: await hashBuffer(bytes) });
+      local.set(file.path, { file, bytes, hash: await hashBuffer(bytes), mtime: file.stat.mtime });
       this.progress("local", "Читаю локальные файлы", index + 1, localFiles.length, file.path);
     }
     this.progress("remote", "Получаю список с сервера", 0, 1);
@@ -147,7 +147,7 @@ export class SyncEngine {
 
   private async syncOne(
     path: string,
-    local: { file: TFile; bytes: ArrayBuffer; hash: string } | undefined,
+    local: { file: TFile; bytes: ArrayBuffer; hash: string; mtime: number } | undefined,
     remote: RemoteEntry | undefined,
     dryRun: boolean,
     summary: SyncSummary
@@ -177,7 +177,8 @@ export class SyncEngine {
           if (!dryRun) this.state[path] = this.makeState(local.bytes, local.hash, remote.etag);
           summary.unchanged++;
         } else {
-          await this.resolveBothChanged(path, local.bytes, rbytes, "", dryRun, summary);
+          await this.resolveBothChanged(path, local.bytes, rbytes, "", dryRun, summary,
+            { localMtime: local.mtime, remoteMtime: remote.mtime });
         }
       }
       return;
@@ -228,7 +229,8 @@ export class SyncEngine {
       summary.downloaded++;
     } else {
       rbytes ??= await this.remoteBytes(r);
-      await this.resolveBothChanged(path, l.bytes, rbytes, previous.baseText ?? "", dryRun, summary);
+      await this.resolveBothChanged(path, l.bytes, rbytes, previous.baseText ?? "", dryRun, summary,
+        { localMtime: l.mtime, remoteMtime: r.mtime });
     }
   }
 
@@ -238,12 +240,13 @@ export class SyncEngine {
     remoteBytes: ArrayBuffer,
     baseText: string,
     dryRun: boolean,
-    summary: SyncSummary
+    summary: SyncSummary,
+    times: MergeTimes
   ): Promise<void> {
     if (isMarkdown(path)) {
       const localText = textDecoder.decode(localBytes);
       const remoteText = textDecoder.decode(remoteBytes);
-      const merged = mergeMarkdown(localText, baseText, remoteText);
+      const merged = mergeMarkdown(localText, baseText, remoteText, times);
       const mergedBytes = toArrayBuffer(textEncoder.encode(merged.text));
       if (!dryRun) {
         if (merged.conflict) await this.backupBoth(path, localBytes, remoteBytes);

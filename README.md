@@ -8,8 +8,22 @@ publishing credentials.
 
 - Markdown uses a real three-way, line-based merge (`local`, `last common`,
   `remote`). Non-overlapping edits merge automatically.
-- Overlapping edits are kept in the note with visible conflict markers and both
-  complete versions are copied to `Safe Sync Backups`.
+- Conflicting regions keep only the newer version, without conflict markers.
+  Both complete originals are backed up separately in `Safe Sync Backups`.
+  The winner is determined from valid, differing YAML `updated` dates when
+  both notes have them, otherwise local mtime versus WebDAV Last-Modified.
+  Equal or unknown times prefer the server. These are file-level dates, not
+  per-line edit history; server upload times and device clock skew can affect
+  the fallback. Update the plugin on every device for consistent behavior.
+- Changes align against the common base using content (LCS), so insertions
+  above a line do not turn into same-number conflicts. Unambiguous unchanged
+  moved blocks carry edits from the other device into their new position.
+  Duplicate or simultaneously rewritten blocks cannot always be identified
+  as moves. If both sides move the same recognized block to different places,
+  the newer complete document wins to avoid duplicate copies of that block.
+  Existing conflict markers are not rewritten automatically by sync. The
+  separate repair utility requires preserved original dates and makes backups
+  before conditional, verified WebDAV writes.
 - Missing files are restored from the other side. Automatic deletion is
   intentionally disabled until durable cross-device tombstones are available.
 - A mass-change guard aborts the run if WebDAV suddenly returns less than half
