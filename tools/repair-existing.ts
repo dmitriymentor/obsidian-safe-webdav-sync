@@ -52,7 +52,10 @@ for (const file of await walk(vault)) {
   if (!etag || etag.startsWith("W/")) throw new Error("A strong ETag is required before repair");
   const backup = path.join(backupDir, relative);
   await fs.mkdir(path.dirname(backup), { recursive: true });
-  await fs.copyFile(file, backup, 1);
+  try { await fs.copyFile(file, backup, 1); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await fs.readFile(backup, "utf8") !== original) throw error;
+  }
   planned.push({ file, original, relative, url, etag, repair });
 }
 console.log(JSON.stringify({ prepared: planned.length, backupDir }));
@@ -70,6 +73,10 @@ for (const item of planned) {
   const bytes = await crypt.decryptData(new Uint8Array(await verified.arrayBuffer()));
   if (hash(bytes) !== hash(Buffer.from(result))) throw new Error("Server verification mismatch");
   patchFile(item.file, item.original, result);
+  for (let retry = 0; retry < 20; retry++) {
+    if (await fs.readFile(item.file, "utf8") === result) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
   if (await fs.readFile(item.file, "utf8") !== result) throw new Error("Local verification mismatch");
   repaired++;
 }
