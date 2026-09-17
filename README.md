@@ -58,8 +58,12 @@ publishing credentials.
 - Non-text conflicts keep both versions instead of silently choosing one.
 - The `updated:` YAML field is merged separately to avoid timestamp-only
   conflicts caused by “Update time on edit”.
-- Manual sync displays a live progress window with the current phase, file,
-  processed count, percentage, elapsed time, and final summary. Pressing sync
+- Routine save/delete/timer syncs no longer show completion toasts (0.2.2).
+  Startup still announces completion. Manual runs report in their progress
+  window, or a toast if it has been closed; errors remain visible in all modes.
+  Manually opening a background run's progress enables its completion notice.
+  The progress window shows the current phase, file, processed count,
+  percentage, elapsed time, and final summary. Pressing sync
   during a background run opens the same run's progress instead of starting a
   second run. Closing and reopening the window keeps the current progress.
   While the server is being scanned, an indeterminate indicator and the number

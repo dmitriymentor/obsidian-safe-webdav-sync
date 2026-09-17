@@ -16,6 +16,7 @@ const DEFAULT_SETTINGS: PluginSettings = {
 export default class SafeWebDavSyncPlugin extends Plugin {
   data: PersistedData = { settings: { ...DEFAULT_SETTINGS }, state: {} };
   private running = false;
+  private notifyCompletion = false;
   private saveTimer: number | undefined;
   private statusEl: HTMLElement | undefined;
   private progressModal: SyncProgressModal | undefined;
@@ -175,7 +176,10 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     if (this.running) {
       // On mobile the status bar may be hidden. Attach to the active run,
       // including an automatic run, rather than only displaying a toast.
-      if (interactive) this.showProgress();
+      if (interactive) {
+        this.notifyCompletion = true;
+        this.showProgress();
+      }
       return;
     }
     if (this.sourcePluginEnabled()) {
@@ -183,6 +187,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
       return;
     }
     this.running = true;
+    this.notifyCompletion = interactive || reason === "при запуске";
     this.clearProgress();
     this.activeDryRun = dryRun;
     this.startedAt = Date.now();
@@ -207,7 +212,12 @@ export default class SafeWebDavSyncPlugin extends Plugin {
       const report = formatSummary(summary, dryRun);
       this.statusEl?.setText(summary.errors.length ? "Safe Sync: есть ошибки" : "Safe Sync: готов");
       this.progressModal?.finish(report, summary.errors);
-      if (!this.progressModal?.visible || summary.conflicts || summary.errors.length) new Notice(`${report}\nЗапуск: ${reason}`, 12000);
+      // Routine save/delete/timer runs stay quiet, even when an overlap was
+      // resolved automatically. Errors still need attention. Manual runs use
+      // the progress window, or a toast if the user has closed that window.
+      if (summary.errors.length || (this.notifyCompletion && !this.progressModal?.visible)) {
+        new Notice(`${report}\nЗапуск: ${reason}`, 12000);
+      }
       console.info(`[safe-webdav-sync] ${report}`);
     } catch (error) {
       this.statusEl?.setText("Safe Sync: ошибка");

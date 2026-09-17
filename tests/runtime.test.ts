@@ -20,8 +20,9 @@ class Modal {
   close() { (this as any).onClose(); }
 }
 class TFile { constructor(public path: string) {} }
+const notices: string[] = [];
 const obsidian = { Modal, TFile, FuzzySuggestModal: Modal, TFolder: class {}, normalizePath: (p: string) => p,
-  Plugin: class {}, PluginSettingTab: class {}, Notice: class {},
+  Plugin: class {}, PluginSettingTab: class {}, Notice: class { constructor(text: string) { notices.push(text); } },
   Setting: class { addButton(callback: any) { const b: any = { setCta: () => b, setButtonText: () => b, onClick: () => b }; callback(b); } } };
 const runtime = (entry: string) => {
   const code = buildSync({ entryPoints: [entry], bundle: true, write: false, format: "cjs", platform: "browser", external: ["obsidian"] }).outputFiles[0]!.text;
@@ -36,6 +37,59 @@ const { legacyBackupTarget, groupLegacyBackups } = runtime("src/backups.ts");
 const { SyncEngine } = runtime("src/sync.ts");
 const buffer = (s: string) => new TextEncoder().encode(s).buffer;
 const digest = async (b: ArrayBuffer) => Buffer.from(await webcrypto.subtle.digest("SHA-256", b)).toString("hex");
+function notificationFixture(options: { conflicts?: number; errors?: string[]; thrown?: boolean; duringRun?: (plugin: any) => Promise<void> } = {}) {
+  const plugin = new Plugin();
+  plugin.app = { vault: { getFiles: () => [] } };
+  plugin.sourcePluginEnabled = () => false;
+  plugin.data.deletionState = { baselineReady: true };
+  plugin.persist = async () => {};
+  plugin.createEngine = async () => ({ run: async () => {
+    if (options.duringRun) await options.duringRun(plugin);
+    if (options.thrown) throw Error("test connection failure");
+    return { uploaded: 1, downloaded: 0, merged: 0, conflicts: options.conflicts ?? 0,
+      deleted: 0, repaired: 0, unchanged: 0, errors: options.errors ?? [] };
+  } });
+  return plugin;
+}
+
+test("save, deletion and timer syncs stay quiet including automatically resolved conflicts", async () => {
+  for (const reason of ["после сохранения", "после удаления", "по расписанию"]) {
+    notices.length = 0;
+    await notificationFixture({ conflicts: 1 }).sync(false, reason);
+    assert.deepEqual(notices, []);
+  }
+});
+
+test("startup announces completion; manual sync keeps its visible progress or reports after closing", async () => {
+  notices.length = 0;
+  await notificationFixture().sync(false, "при запуске");
+  assert.equal(notices.length, 1);
+  for (const reason of ["вручную", "командой", "настройки", "проверка"]) {
+    notices.length = 0;
+    const plugin = notificationFixture();
+    try { await plugin.sync(false, reason); assert.equal(plugin.progressModal.visible, true); assert.equal(notices.length, 0); }
+    finally { plugin.progressModal.close(); }
+    await notificationFixture({ duringRun: async p => p.progressModal.close() }).sync(false, reason);
+    assert.equal(notices.length, 1);
+  }
+});
+
+test("manual attachment to a background sync enables its completion notice if progress is closed", async () => {
+  notices.length = 0;
+  await notificationFixture({ duringRun: async p => { await p.sync(false, "вручную"); p.progressModal.close(); } }).sync(false, "после сохранения");
+  assert.equal(notices.length, 1);
+});
+
+test("background sync errors remain visible", async () => {
+  notices.length = 0;
+  await notificationFixture({ errors: ["note.md: HTTP 503"] }).sync(false, "по расписанию");
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!, /Ошибок: 1/);
+  notices.length = 0;
+  await notificationFixture({ thrown: true }).sync(false, "после сохранения");
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!, /connection failure/);
+});
 async function deletionFixture() {
   const file = new TFile("note.md");
   const original = buffer("old content");
