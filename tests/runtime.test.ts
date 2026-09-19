@@ -16,6 +16,7 @@ class Element {
 class Modal {
   titleEl = new Element(); contentEl = new Element(); opens = 0;
   constructor(public app: any) {}
+  onOpen() {}
   open() { this.opens++; (this as any).onOpen(); }
   close() { (this as any).onClose(); }
 }
@@ -96,6 +97,16 @@ async function deletionFixture() {
   const files = new Map([[file.path, { file, bytes: original }]]);
   const remote = new Map([[file.path, { bytes: original, etag: '"v1"' }]]);
   const deletes: string[] = [];
+  const archive = new Map<string, ArrayBuffer | string>();
+  const folders = new Set<string>();
+  const adapter = {
+    exists: async (p: string) => archive.has(p) || folders.has(p) || files.has(p),
+    mkdir: async (p: string) => { folders.add(p); },
+    readBinary: async (p: string) => archive.get(p) as ArrayBuffer,
+    writeBinary: async (p: string, b: ArrayBuffer) => { archive.set(p, b); },
+    read: async (p: string) => archive.get(p) as string,
+    write: async (p: string, s: string) => { archive.set(p, s); }
+  };
   const state: any = { "note.md": { baseHash: await digest(original) } };
   const engine: any = Object.create(SyncEngine.prototype);
   Object.assign(engine, { runId: "test-run", state, saveState: async () => {},
@@ -113,11 +124,11 @@ async function deletionFixture() {
       readBinary: async (f: TFile) => files.get(f.path)!.bytes,
       modifyBinary: async (f: TFile, bytes: ArrayBuffer) => files.set(f.path, { file: f, bytes }),
       createBinary: async (p: string, bytes: ArrayBuffer) => files.set(p, { file: new TFile(p), bytes }),
-      createFolder: async () => {}, adapter: { exists: async () => true },
+      createFolder: async () => {}, adapter,
       rename: async (f: TFile, p: string) => { const value = files.get(f.path)!; files.delete(f.path); f.path = p; files.set(p, value); }
     } } });
   const intent = { id: "id", path: "note.md", baseHash: await digest(original) };
-  return { engine, files, remote, deletes, state, intent, summary: { deleted: 0, conflicts: 0 } };
+  return { engine, files, remote, deletes, state, intent, archive, summary: { deleted: 0, conflicts: 0 } };
 }
 
 async function legacyFixture() {
@@ -224,7 +235,7 @@ test("migration repairs an old mobile base and saves only clean text on both sid
   assert.equal(f.state["note.md"].baseText, f.clean);
   assert.equal(f.summary.repaired, 1);
   assert.equal(f.deletes.length, 0);
-  assert.ok([...f.files.keys()].some(p => p.includes("Конфликты/Локальная/note.md")));
+  assert.ok([...f.archive.keys()].some(p => p.startsWith(".safe-sync-backups/v1/conflict/") && p.endsWith(".bin")));
 });
 
 test("migration dry run and malformed markers never mutate either side", async () => {
@@ -265,11 +276,60 @@ test("migration verifies the remote again even when the clean server needs no wr
   const get = f.engine.webdav.getObject;
   let reads = 0;
   f.engine.webdav.getObject = async (p: string) => {
-    if (++reads > 1) return { bytes: buffer("concurrent edit"), etag: '"changed"' };
+    if (p === "note.md" && ++reads > 1) return { bytes: buffer("concurrent edit"), etag: '"changed"' };
     return get(p);
   };
   await assert.rejects(f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], false, f.summary), /Сервер изменился/);
   assert.equal(new TextDecoder().decode(f.files.get("note.md")!.bytes), f.dirty);
+});
+
+test("backups avoid note-plugin events, deduplicate across attempts, and export without replacing originals", async () => {
+  const f = await deletionFixture(), original = f.files.get("note.md")!.bytes;
+  const create = f.engine.app.vault.createBinary;
+  f.engine.app.vault.createBinary = async () => { throw Error("note date plugin touched visible backup"); };
+  await f.engine.backupBoth("note.md", original, buffer("server content"));
+  const inventory = [...f.archive.keys()], remoteSize = f.remote.size;
+  f.engine.runId = "second-run";
+  await f.engine.backupBoth("note.md", original, buffer("server content"));
+  assert.deepEqual([...f.archive.keys()], inventory);
+  assert.equal(f.remote.size, remoteSize); assert.equal(f.files.size, 1);
+  const record = JSON.parse([...f.archive].find(([p]) => p.endsWith(".json"))![1] as string);
+  f.engine.app.vault.createBinary = create;
+  const destination = await f.engine.exportBackup(record);
+  assert.match(destination, /Safe Sync Backups\/second-run\/Восстановленные\/note.md/);
+  assert.deepEqual(f.files.get("note.md")!.bytes, original);
+  assert.deepEqual(f.files.get(destination)!.bytes, original);
+  await assert.rejects(f.engine.exportBackup(record), /уже есть/);
+});
+
+test("full error reports survive reload and pause automatic retries until a successful real run", async () => {
+  const errors = Array.from({ length: 54 }, (_, i) => `note-${i}.md: backup verification failed`);
+  const p = notificationFixture({ errors });
+  let calls = 0; const create = p.createEngine;
+  p.createEngine = async (...args: any[]) => { calls++; return create(...args); };
+  await p.sync(false, "по расписанию");
+  assert.equal(p.data.lastReport.errors.length, 54);
+  assert.equal(p.data.automaticSyncBlocked, true);
+  await p.sync(false, "при запуске"); await p.sync(false, "после сохранения");
+  assert.equal(calls, 1);
+  const saved = JSON.parse(JSON.stringify(p.data));
+  const reloaded = new Plugin();
+  reloaded.loadData = async () => saved; reloaded.saveData = async () => {};
+  reloaded.app = { vault: { on: () => {}, getFiles: () => [] }, workspace: { onLayoutReady: (f: any) => f() } };
+  for (const method of ["registerEvent", "addRibbonIcon", "addCommand", "addSettingTab"]) reloaded[method] = () => {};
+  reloaded.addStatusBarItem = () => new Element();
+  reloaded.registerInterval = (id: any) => { clearInterval(id); clearTimeout(id); };
+  await reloaded.onload();
+  assert.deepEqual(reloaded.data.lastReport.errors, errors);
+  reloaded.showLastReport(); // Does not create an engine or start synchronization.
+  reloaded.createEngine = notificationFixture().createEngine;
+  await reloaded.sync(true, "проверка");
+  assert.equal(reloaded.data.automaticSyncBlocked, true);
+  assert.equal(reloaded.data.lastErrorReport.errors.length, 54);
+  await reloaded.sync(false, "командой");
+  assert.equal(reloaded.data.automaticSyncBlocked, false);
+  assert.equal(reloaded.data.lastErrorReport.errors.length, 54);
+  reloaded.progressModal.close(); reloaded.onunload();
 });
 
 test("deletion archives verified copies before removing only the unchanged revision", async () => {

@@ -9,7 +9,8 @@ publishing credentials.
 - Markdown uses a real three-way, line-based merge (`local`, `last common`,
   `remote`). Non-overlapping edits merge automatically.
 - Conflicting regions keep only the newer version, without conflict markers.
-  Both complete originals are backed up separately in `Safe Sync Backups`.
+  Both distinct complete originals are retained in the protected backup archive
+  (0.2.5); older visible copies remain in `Safe Sync Backups`.
   The winner is determined from valid, differing YAML `updated` dates when
   both notes have them, otherwise local mtime versus WebDAV Last-Modified.
   Equal or unknown times prefer the server. These are file-level dates, not
@@ -74,7 +75,7 @@ publishing credentials.
   second run. Closing and reopening the window keeps the current progress.
   While the server is being scanned, an indeterminate indicator and the number
   of scanned folders are shown; 100% is displayed only after completion.
-- New backups share a date/run directory, subdivided into conflicts and deleted
+- Older backups share a date/run directory, subdivided into conflicts and deleted
   files with original paths. Old one-file timestamp directories are grouped by
   date after a successful sync, or via "Сгруппировать старые бекапы". Timestamp
   suffixes preserve every distinct old version; occupied destinations are skipped,
@@ -82,6 +83,31 @@ publishing credentials.
   are excluded from normal traversal; encrypted backup contents remain retained.
 
 ## Installation
+
+Version 0.2.5 protects new backup contents from Markdown plugins. They are
+encrypted with the existing vault encryption password and written via the data
+adapter as hidden `.safe-sync-backups/v1` binary objects. Local JSON metadata
+contains original paths, hashes, kind and first archive time, not note content.
+Keep this hidden directory and the encryption password when backing up a device.
+The key is still imported from Remotely Save; do not delete that configuration.
+
+Each original path/content hash/kind has one local copy, even after restart or
+failed upload. Verified remote versions are reused with create-only conditional
+publication; corrupted archives stop processing and are never overwritten.
+Deletion archives retain the old remote path for cross-version restore support.
+No old backup is migrated or removed, and verification checks are not disabled.
+Use settings → **Защищённые бекапы → Открыть архив** to decrypt a selected version
+into a new visible copy, never over the working note. Exported copies and the
+originals moved into the deletion recovery tree are ordinary visible files;
+their protected archive remains immutable. Hidden archive contents stay out of
+the note index and regular sync traversal.
+
+Settings → **Последний отчёт → Открыть** shows all errors from the last run and
+retains the last failed report after a subsequent success. Reports persist in
+the plugin data on this device; opening them does not start sync. Any sync error
+pauses automatic retries across restarts; only a successful real manual run
+clears the pause (a dry run does not). The user's auto-sync toggles are preserved.
+Reports before installing 0.2.5 cannot be reconstructed from the new report UI.
 
 Version 0.2.4 scans up to four server directories concurrently and reuses the
 clean remote body already fetched for legacy-conflict inspection within that

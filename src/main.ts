@@ -1,7 +1,8 @@
 import { Modal, Notice, Plugin, PluginSettingTab, Setting, FuzzySuggestModal, TFile, type TAbstractFile, type App } from "obsidian";
 import { importRemotelySaveConfig } from "./import-config";
 import { SyncEngine } from "./sync";
-import type { PersistedData, PluginSettings, SyncProgress, SyncSummary } from "./types";
+import type { PersistedData, PluginSettings, SyncProgress, SyncSummary, SyncReport } from "./types";
+import type { BackupRecord } from "./backup-store";
 import { userPath } from "./deletions";
 import { groupLegacyBackups } from "./backups";
 
@@ -43,6 +44,9 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     this.data = {
       settings: { ...DEFAULT_SETTINGS, ...(loaded?.settings ?? {}) },
       state: loaded?.state ?? {},
+      lastReport: loaded?.lastReport,
+      lastErrorReport: loaded?.lastErrorReport,
+      automaticSyncBlocked: loaded?.automaticSyncBlocked ?? false,
       deletionState: loaded?.deletionState ?? { deviceId: crypto.randomUUID(), pending: [], knownIds: [], baselineReady: false }
     };
     await this.persist();
@@ -53,6 +57,8 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     this.addCommand({ id: "test-connection", name: "Проверить WebDAV и шифрование", callback: () => void this.checkConnection() });
     this.addCommand({ id: "restore-deleted", name: "Восстановить удалённый файл", callback: () => void this.restoreDeleted() });
     this.addCommand({ id: "group-backups", name: "Сгруппировать старые бекапы", callback: () => void this.groupBackups() });
+    this.addCommand({ id: "last-report", name: "Последний отчёт синхронизации", callback: () => this.showLastReport() });
+    this.addCommand({ id: "browse-backups", name: "Открыть защищённый архив бекапов", callback: () => void this.browseBackups() });
     this.statusEl = this.addStatusBarItem();
     this.statusEl.setText("Safe Sync: готов");
     this.addSettingTab(new SafeSyncSettingTab(this.app, this));
@@ -91,6 +97,52 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     const save = this.persistQueue.then(() => this.saveData(this.data));
     this.persistQueue = save.catch(() => {});
     await save;
+  }
+
+  private async rememberReport(report: SyncReport): Promise<void> {
+    this.data.lastReport = report;
+    if (report.errors.length) {
+      this.data.lastErrorReport = report;
+      this.data.automaticSyncBlocked = true;
+      window.clearTimeout(this.saveTimer);
+    } else if (!report.dryRun) this.data.automaticSyncBlocked = false;
+    await this.persist();
+  }
+
+  showLastReport(): void {
+    const latest = this.data.lastReport;
+    if (!latest) { new Notice("Сохранённого отчёта ещё нет. Отчёты сохраняются начиная с версии 0.2.5"); return; }
+    const modal = new Modal(this.app);
+    modal.titleEl.setText("Последний отчёт синхронизации");
+    if (this.data.automaticSyncBlocked) modal.contentEl.createEl("p", { text: "Автосинхронизация приостановлена после ошибок. После устранения причины запустите вручную; успешный запуск снимет паузу." });
+    const show = (r: SyncReport, title: string) => {
+      modal.contentEl.createEl("h3", { text: title });
+      const text = `${new Date(r.finishedAt).toLocaleString()} · ${r.reason}${r.dryRun ? " · без записи" : ""}\n${r.report}\n${r.errors.length ? r.errors.join("\n\n") : "Ошибок нет"}`;
+      const el = modal.contentEl.createEl("pre", { text });
+      el.style.whiteSpace = "pre-wrap"; el.style.overflowWrap = "anywhere"; el.style.userSelect = "text";
+    };
+    show(latest, "Последний запуск");
+    const previousError = this.data.lastErrorReport;
+    if (!latest.errors.length && previousError) show(previousError, "Предыдущий запуск с ошибками");
+    modal.open();
+  }
+
+  async browseBackups(): Promise<void> {
+    if (this.running) { new Notice("Дождитесь завершения синхронизации"); return; }
+    this.running = true;
+    try {
+      const engine = await this.createEngine(false);
+      const records = await engine.listBackups();
+      if (!records.length) { new Notice("Новых защищённых бекапов пока нет. Прежние копии остались в Safe Sync Backups"); return; }
+      new BackupPicker(this.app, records, async record => {
+        if (this.running) { new Notice("Дождитесь завершения текущей операции"); return; }
+        this.running = true;
+        try { new Notice(`Копия извлечена: ${await engine.exportBackup(record)}\nРабочая заметка не заменена.`, 15000); }
+        catch (error) { new Notice(message(error), 15000); }
+        finally { this.running = false; }
+      }).open();
+    } catch (error) { new Notice(message(error), 15000); }
+    finally { this.running = false; }
   }
 
   private async captureDeletion(oldPath: string, renamed?: TAbstractFile): Promise<void> {
@@ -183,6 +235,10 @@ export default class SafeWebDavSyncPlugin extends Plugin {
       }
       return;
     }
+    if (!interactive && this.data.automaticSyncBlocked) {
+      this.statusEl?.setText("Safe Sync: автосинхронизация на паузе — откройте последний отчёт");
+      return;
+    }
     if (this.sourcePluginEnabled()) {
       new Notice("Синхронизация не запущена: сначала отключите Remotely Save.", 8000);
       return;
@@ -211,6 +267,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
         await groupLegacyBackups(this.app);
       }
       const report = formatSummary(summary, dryRun);
+      await this.rememberReport({ startedAt: this.startedAt, finishedAt: Date.now(), reason, dryRun, report, errors: [...summary.errors] });
       this.statusEl?.setText(summary.errors.length ? "Safe Sync: есть ошибки" : "Safe Sync: готов");
       this.progressModal?.finish(report, summary.errors);
       // Routine save/delete/timer runs stay quiet, even when an overlap was
@@ -221,6 +278,8 @@ export default class SafeWebDavSyncPlugin extends Plugin {
       }
       console.info(`[safe-webdav-sync] ${report}`);
     } catch (error) {
+      try { await this.rememberReport({ startedAt: this.startedAt, finishedAt: Date.now(), reason, dryRun, report: "Запуск прерван", errors: [message(error)] }); }
+      catch { new Notice("Не удалось сохранить отчёт. Автосинхронизация приостановлена в этой сессии; сохраните текст ошибки", 15000); }
       this.statusEl?.setText("Safe Sync: ошибка");
       this.progressModal?.fail(message(error));
       new Notice(`Safe Sync: ${message(error)}`, 12000);
@@ -350,6 +409,13 @@ class SafeSyncSettingTab extends PluginSettingTab {
       : "Remotely Save выключен — Safe Sync может работать.";
     containerEl.createEl("p", { text: sourceState, cls: this.plugin.sourcePluginEnabled() ? "mod-warning" : "mod-success" });
 
+    new Setting(containerEl).setName("Последний отчёт")
+      .setDesc(this.plugin.data.automaticSyncBlocked ? "Автосинхронизация на паузе из-за ошибок. Здесь сохранён полный список." : "Открывает сохранённый результат без запуска новой синхронизации.")
+      .addButton(button => button.setButtonText("Открыть").onClick(() => this.plugin.showLastReport()));
+    new Setting(containerEl).setName("Защищённые бекапы")
+      .setDesc("Новые копии зашифрованы и скрыты от плагинов заметок. Можно извлечь отдельную версию без замены оригинала.")
+      .addButton(button => button.setButtonText("Открыть архив").onClick(() => void this.plugin.browseBackups()));
+
     new Setting(containerEl)
       .setName("Проверить подключение")
       .setDesc("Проверяет WebDAV и расшифровку имён, не изменяя файлы.")
@@ -414,6 +480,15 @@ class DeletedFilePicker extends FuzzySuggestModal<string> {
   getItems() { return this.paths; }
   getItemText(path: string) { return path; }
   onChooseItem(path: string) { void this.selected(path); }
+}
+
+class BackupPicker extends FuzzySuggestModal<BackupRecord> {
+  constructor(app: App, private records: BackupRecord[], private selected: (record: BackupRecord) => Promise<void>) {
+    super(app); this.setPlaceholder("Выберите версию для извлечения копии");
+  }
+  getItems() { return this.records; }
+  getItemText(record: BackupRecord) { return `${record.path} · ${record.savedAt} · ${record.kind === "conflict" ? "конфликт" : "удаление"} · ${record.hash.slice(0, 8)}`; }
+  onChooseItem(record: BackupRecord) { void this.selected(record); }
 }
 
 function choose<T extends string>(app: App, title: string, description: string,

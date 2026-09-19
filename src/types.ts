@@ -29,9 +29,21 @@ export interface FileState {
 }
 
 export interface PersistedData {
+  lastReport?: SyncReport;
+  lastErrorReport?: SyncReport;
+  automaticSyncBlocked?: boolean;
   deletionState?: DeletionState;
   settings: PluginSettings;
   state: Record<string, FileState>;
+}
+
+export interface SyncReport {
+  startedAt: number;
+  finishedAt: number;
+  reason: string;
+  dryRun: boolean;
+  report: string;
+  errors: string[];
 }
 
 export interface DeleteIntent {

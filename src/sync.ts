@@ -7,6 +7,7 @@ import { WebDav, type RawRemoteEntry } from "./webdav";
 import { DeletionJournal, JOURNAL, deletionConflicts, needsMassConfirmation, userPath } from "./deletions";
 import { backupRunId } from "./backups";
 import { syncWriteOptions } from "./file-times";
+import { BackupStore, type BackupRecord } from "./backup-store";
 import type { DeletionHooks, DeleteIntent } from "./types";
 
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -435,18 +436,19 @@ export class SyncEngine {
   }
 
   private async backupBoth(path: string, local?: ArrayBuffer, remote?: ArrayBuffer): Promise<void> {
-    for (const [label, side, bytes] of [["Локальная", "local", local], ["Сервер", "remote", remote]] as const) {
-      if (!bytes) continue;
-      const localPath = `${LOCAL_BACKUPS}/${this.runId}/Конфликты/${label}/${path}`;
-      await this.writeLocal(localPath, bytes);
-      const file = this.app.vault.getAbstractFileByPath(localPath);
-      const remotePath = `${SAFETY_PREFIX}${this.runId}/${side}/${path}`;
-      await this.upload(remotePath, bytes);
-      if (!(file instanceof TFile) || await hashBuffer(await this.app.vault.readBinary(file)) !== await hashBuffer(bytes) ||
-          await hashBuffer(await this.crypt.decrypt(await this.webdav.get(await this.crypt.encryptPath(remotePath)))) !== await hashBuffer(bytes)) {
-        throw new Error("Резервная копия не прошла проверку; оригиналы не изменены");
-      }
-    }
+    const store = this.backupStore();
+    for (const bytes of [local, remote]) if (bytes) await store.save(path, bytes, "conflict");
+  }
+
+  private backupStore(): BackupStore { return new BackupStore(this.app.vault.adapter, this.crypt, this.webdav); }
+  async listBackups(): Promise<BackupRecord[]> { return this.backupStore().list(); }
+  async exportBackup(record: BackupRecord): Promise<string> {
+    const bytes = await this.backupStore().read(record);
+    // Export a copy only; never replace the working note or an existing export.
+    const destination = `${LOCAL_BACKUPS}/${this.runId}/Восстановленные/${record.path}`;
+    if (await this.app.vault.adapter.exists(destination)) throw Error("Копия с таким путём уже есть; повторите открытие архива");
+    await this.writeLocal(destination, bytes);
+    return destination;
   }
 
   private async applyDeletion(path: string, intents: DeleteIntent[], dryRun: boolean, summary: SyncSummary): Promise<void> {
@@ -506,15 +508,8 @@ export class SyncEngine {
     if (local || remote) summary.deleted++;
   }
 
-  private async archiveDeleted(path: string, bytes: ArrayBuffer, side: string): Promise<void> {
-    const hash = await hashBuffer(bytes);
-    // Content-addressed versions allow safe retry without replacing a backup.
-    const backup = `${SAFETY_PREFIX}Удалённые/${hash}/${path}`;
-    const encrypted = await this.crypt.encryptPath(backup);
-    const existing = await this.webdav.getObject(encrypted);
-    if (!existing) await this.webdav.put(encrypted, await this.crypt.encrypt(bytes), { "If-None-Match": "*" });
-    if (await hashBuffer(await this.crypt.decrypt(await this.webdav.get(encrypted))) !== hash) throw new Error("Бекап удаления не прошёл проверку");
-    await this.writeLocal(`${LOCAL_BACKUPS}/${this.runId}/Удалённые/${side}/${path}`, bytes);
+  private async archiveDeleted(path: string, bytes: ArrayBuffer, _side: string): Promise<void> {
+    await this.backupStore().save(path, bytes, "deletion");
   }
 
   async deletedPaths(): Promise<string[]> {
