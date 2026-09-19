@@ -99,7 +99,7 @@ async function deletionFixture() {
   const state: any = { "note.md": { baseHash: await digest(original) } };
   const engine: any = Object.create(SyncEngine.prototype);
   Object.assign(engine, { runId: "test-run", state, saveState: async () => {},
-    deletionHooks: { data: { deviceId: "test-device" }, mutations: new Set() },
+    deletionHooks: { data: { deviceId: "test-device", pending: [] }, mutations: new Set() },
     crypt: { encryptPath: async (p: string) => p, encrypt: async (b: ArrayBuffer) => b, decrypt: async (b: ArrayBuffer) => b },
     webdav: {
       get: async (p: string) => remote.get(p)!.bytes,
@@ -134,6 +134,44 @@ async function legacyFixture() {
   const summary = { repaired: 0, conflicts: 0 };
   return { ...f, local, entry: remote, clean, dirty, summary };
 }
+
+test("identical local writes do not touch mtime or emit modify", async () => {
+  const f = await deletionFixture();
+  f.engine.app.vault.modifyBinary = async () => { throw Error("unexpected write"); };
+  await f.engine.writeLocal("note.md", f.files.get("note.md")!.bytes, Date.now());
+});
+
+test("downloaded and merged notes retain their author dates while real edits can advance them", async () => {
+  const f = await deletionFixture();
+  const stamp = Date.parse("2026-08-01T10:00");
+  const original = "---\nupdated: 2026-08-01T10:00\n---\nnew remote body\n";
+  let changes = 0;
+  f.engine.app.vault.modifyBinary = async (file: any, bytes: ArrayBuffer, options: any) => {
+    changes++;
+    // Update time on edit compares filesystem mtime with the note's updated.
+    // A normal write (without options) would use Date.now() and bump the date.
+    assert.equal(options.mtime, stamp);
+    assert.equal((options.mtime ?? Date.now()) > stamp + 60000, false);
+    file.stat = { ctime: stamp, ...options };
+    f.files.set(file.path, { file, bytes });
+  };
+  await f.engine.writeLocal("note.md", buffer(original), Date.now());
+  await f.engine.writeLocal("note.md", buffer(original), Date.now());
+  assert.equal(changes, 1);
+  assert.equal(new TextDecoder().decode(f.files.get("note.md")!.bytes), original);
+  // A subsequent user edit receives the current OS mtime, not a persistent
+  // lock or overridden listener; the date plugin can then update normally.
+  assert.ok(Date.now() > stamp + 60000);
+});
+
+test("new downloaded notes pass their source timestamps to createBinary", async () => {
+  const f = await deletionFixture();
+  let options: any;
+  f.engine.app.vault.createBinary = async (_p: string, _b: ArrayBuffer, o: any) => { options = o; };
+  await f.engine.writeLocal("new.md", buffer("---\ncreated: 2024-01-01\nupdated: 2026-01-01\n---\nbody"), Date.now());
+  assert.equal(options.mtime, Date.parse("2026-01-01"));
+  assert.equal(options.ctime, Date.parse("2024-01-01"));
+});
 
 test("migration repairs an old mobile base and saves only clean text on both sides", async () => {
   const f = await legacyFixture();

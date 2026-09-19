@@ -58,6 +58,12 @@ publishing credentials.
 - Non-text conflicts keep both versions instead of silently choosing one.
 - The `updated:` YAML field is merged separately to avoid timestamp-only
   conflicts caused by “Update time on edit”.
+- Version 0.2.3 preserves Markdown `created`/`updated` file times when applying
+  synchronized content, so “Update time on edit” does not mistake a download
+  for a new edit. Identical bytes are not rewritten. Notes without valid dates
+  fall back to the known source/file times. Real edits still update dates.
+  Backup writes no longer enqueue save-triggered syncs. Update every device
+  before synchronizing restored historical dates.
 - Routine save/delete/timer syncs no longer show completion toasts (0.2.2).
   Startup still announces completion. Manual runs report in their progress
   window, or a toast if it has been closed; errors remain visible in all modes.

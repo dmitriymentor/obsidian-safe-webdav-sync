@@ -6,6 +6,7 @@ import type { FileState, ImportedConfig, RemoteEntry, SyncProgress, SyncSummary 
 import { WebDav, type RawRemoteEntry } from "./webdav";
 import { DeletionJournal, JOURNAL, deletionConflicts, needsMassConfirmation, userPath } from "./deletions";
 import { backupRunId } from "./backups";
+import { syncWriteOptions } from "./file-times";
 import type { DeletionHooks, DeleteIntent } from "./types";
 
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -224,7 +225,7 @@ export class SyncEngine {
       }
       if (!local && remote) {
         const bytes = await this.remoteBytes(remote);
-        if (!dryRun) await this.writeLocal(path, bytes);
+        if (!dryRun) await this.writeLocal(path, bytes, remote.mtime);
         if (!dryRun) this.state[path] = this.makeState(bytes, await hashBuffer(bytes), remote.etag);
         summary.downloaded++;
         return;
@@ -248,7 +249,7 @@ export class SyncEngine {
       const rhash = await hashBuffer(rbytes);
       // A missing local file can be an incomplete mobile listing or an app-side
       // move. Restore from the encrypted server instead of deleting remotely.
-      if (!dryRun) await this.writeLocal(path, rbytes);
+      if (!dryRun) await this.writeLocal(path, rbytes, remote.mtime);
       if (!dryRun) this.state[path] = this.makeState(rbytes, rhash, remote.etag);
       summary.downloaded++;
       return;
@@ -283,7 +284,7 @@ export class SyncEngine {
       summary.uploaded++;
     } else if (!localChanged && remoteChanged) {
       rbytes ??= await this.remoteBytes(r);
-      if (!dryRun) await this.writeLocal(path, rbytes);
+      if (!dryRun) await this.writeLocal(path, rbytes, r.mtime);
       if (!dryRun) this.state[path] = this.makeState(rbytes, rhash, r.etag);
       summary.downloaded++;
     } else {
@@ -345,7 +346,7 @@ export class SyncEngine {
         throw new Error("Сервер изменился после исправления — локальная версия сохранена");
       }
       await assertLocalUnchanged();
-      if (changesLocal) await this.writeLocal(path, bytes);
+      if (changesLocal) await this.writeLocal(path, bytes, Math.max(local?.mtime ?? 0, remote?.mtime ?? 0));
       this.state[path] = this.makeState(bytes, hash, verified.etag);
       await this.saveState();
     }
@@ -370,7 +371,7 @@ export class SyncEngine {
       const mergedBytes = toArrayBuffer(textEncoder.encode(merged.text));
       if (!dryRun) {
         if (merged.conflict) await this.backupBoth(path, localBytes, remoteBytes);
-        await this.writeLocal(path, mergedBytes);
+        await this.writeLocal(path, mergedBytes, Math.max(times.localMtime, times.remoteMtime));
         this.state[path] = await this.uploadAndState(path, mergedBytes, await hashBuffer(mergedBytes));
       }
       summary.merged++;
@@ -408,12 +409,15 @@ export class SyncEngine {
     }
   }
 
-  private async writeLocal(path: string, bytes: ArrayBuffer): Promise<void> {
+  private async writeLocal(path: string, bytes: ArrayBuffer, sourceMtime?: number): Promise<void> {
     if (this.deletionHooks?.data.pending.some(intent => intent.path === path)) throw new Error("Файл удалён пользователем во время синхронизации; ожидает обработки удаления");
     await this.ensureLocalFolder(path);
     const existing = this.app.vault.getAbstractFileByPath(path);
-    if (existing instanceof TFile) await this.app.vault.modifyBinary(existing, bytes);
-    else await this.app.vault.createBinary(path, bytes);
+    // Identical merges must not emit modify or move the filesystem clock.
+    if (existing instanceof TFile && await hashBuffer(await this.app.vault.readBinary(existing)) === await hashBuffer(bytes)) return;
+    const options = syncWriteOptions(path, bytes, existing instanceof TFile ? existing.stat : undefined, sourceMtime);
+    if (existing instanceof TFile) await this.app.vault.modifyBinary(existing, bytes, options);
+    else await this.app.vault.createBinary(path, bytes, options);
   }
 
   private async backupBoth(path: string, local?: ArrayBuffer, remote?: ArrayBuffer): Promise<void> {
@@ -522,7 +526,7 @@ export class SyncEngine {
     }
     if (!bytes) throw new Error("Копия ещё не загружена в корзину сервера. Проверьте локальные бекапы исходного устройства");
     await this.ensureLocalFolder(path);
-    await this.app.vault.createBinary(path, bytes);
+    await this.writeLocal(path, bytes);
     await this.journal!.keep(intents);
     await this.saveState();
   }

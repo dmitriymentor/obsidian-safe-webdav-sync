@@ -57,7 +57,8 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     this.statusEl.setText("Safe Sync: готов");
     this.addSettingTab(new SafeSyncSettingTab(this.app, this));
 
-    this.registerEvent(this.app.vault.on("modify", () => {
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (!userPath(file.path)) return;
       if (!this.data.settings.syncOnSave || this.sourcePluginEnabled()) return;
       window.clearTimeout(this.saveTimer);
       this.saveTimer = window.setTimeout(() => void this.sync(false, "после сохранения"), 1200);
