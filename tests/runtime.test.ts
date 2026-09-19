@@ -37,6 +37,81 @@ const Plugin = runtime("src/main.ts").default;
 const { legacyBackupTarget, groupLegacyBackups } = runtime("src/backups.ts");
 const { SyncEngine } = runtime("src/sync.ts");
 const buffer = (s: string) => new TextEncoder().encode(s).buffer;
+test("long-name planning is read-only and remote/deletion history prevents automatic renaming", async () => {
+  const file = new TFile("Base/" + "я".repeat(120) + ".md");
+  const engine = Object.create(SyncEngine.prototype);
+  engine.app = { vault: { getAllLoadedFiles: () => [file], getFiles: () => [file] } };
+  engine.crypt = { encryptPath: async (p: string) => p.split("/").map(part => "x".repeat(Buffer.byteLength(part) * 2)).join("/") };
+  engine.state = {};
+  let summary: any = { errors: [] };
+  const skipped = await engine.repairLongNames(new Map(), true, summary);
+  assert.equal(summary.renamed, 1); assert.equal(summary.errors.length, 0);
+  assert.ok(skipped.has(file.path));
+  engine.state[file.path] = { existsRemote: true };
+  summary = { errors: [] };
+  await engine.repairLongNames(new Map(), false, summary);
+  assert.match(summary.errors[0], /историей/);
+  engine.state = {};
+  engine.deletionHooks = { data: { pending: [{ path: "old.md", renameTo: file.path }] } };
+  summary = { errors: [] };
+  await engine.repairLongNames(new Map(), false, summary);
+  assert.match(summary.errors[0], /историей/);
+});
+
+test("sync checks remote safety before renaming and scans updated paths/text afterwards", async () => {
+  const file: any = new TFile("Base/" + "я".repeat(120) + ".md");
+  file.stat = { mtime: 1000000, ctime: 1000000 };
+  const old = file.path;
+  const engine = Object.create(SyncEngine.prototype);
+  let text = "Original body", writes = 0;
+  const archives = new Map();
+  engine.app = { vault: {
+    getFiles: () => [file], getAllLoadedFiles: () => [file],
+    getAbstractFileByPath: (p: string) => p === file.path ? file : null,
+    read: async () => text, readBinary: async () => buffer(text),
+    process: async (_f: any, fn: any) => { text = fn(text); writes++; },
+    adapter: { exists: async (p: string) => archives.has(p), mkdir: async (p: string) => archives.set(p, null),
+      writeBinary: async (p: string, b: ArrayBuffer) => archives.set(p, b), readBinary: async (p: string) => archives.get(p) }
+  }, fileManager: { renameFile: async (_f: any, p: string) => { file.path = p; } } };
+  engine.crypt = { encryptPath: async (p: string) => p.split("/").map(part => "x".repeat(Buffer.byteLength(part) * 2)).join("/"),
+    encrypt: async (b: ArrayBuffer) => b, decrypt: async (b: ArrayBuffer) => b };
+  engine.nameRepairs = []; engine.saveState = async () => {};
+  engine.state = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [String(i), { existsRemote: true }]));
+  engine.readRemoteIndex = async () => new Map();
+  await assert.rejects(engine.run(false), /Защитная остановка/);
+  assert.equal(writes, 0); assert.equal(file.path, old);
+  engine.state = {};
+  const seen: string[] = [];
+  engine.syncOne = async (p: string, local: any) => {
+    seen.push(p); assert.notEqual(p, old); assert.ok(new TextDecoder().decode(local.bytes).includes("# "));
+  };
+  const result = await engine.run(false);
+  assert.equal(result.errors.length, 0); assert.equal(result.renamed, 1);
+  assert.deepEqual(seen, [file.path]); assert.equal(writes, 1);
+  assert.equal(engine.nameRepairs[0].completed, true);
+});
+
+test("a peer's deterministic short name with the full title is reused, not duplicated", async () => {
+  const file: any = new TFile("Base/" + "я".repeat(120) + ".md");
+  const engine = Object.create(SyncEngine.prototype);
+  engine.app = { vault: { getAllLoadedFiles: () => [file], getFiles: () => [file], getAbstractFileByPath: () => null } };
+  engine.crypt = { encryptPath: async (p: string) => p.split("/").map(part => "x".repeat(Buffer.byteLength(part) * 2)).join("/") };
+  engine.state = {};
+  const { shorterNotePath } = runtime("src/long-names.ts");
+  const expected = await shorterNotePath(file.path, engine.crypt, []);
+  const remote = new Map([[expected, {}]]);
+  engine.remoteBytes = async () => buffer("# " + "я".repeat(120) + "\n\nServer text");
+  const planned: string[] = [];
+  engine.onProgress = (p: any) => planned.push(p.path);
+  const summary: any = { errors: [] };
+  await engine.repairLongNames(remote, true, summary);
+  assert.equal(summary.renamed, 1); assert.equal(summary.errors.length, 0);
+  assert.deepEqual(planned, [`${file.path} → ${expected}`]);
+  engine.journal = { active: new Map([[expected, []]]) };
+  const blocked: any = { errors: [] };
+  await engine.repairLongNames(remote, true, blocked);
+  assert.match(blocked.errors[0], /удалением/);
+});
 const digest = async (b: ArrayBuffer) => Buffer.from(await webcrypto.subtle.digest("SHA-256", b)).toString("hex");
 function notificationFixture(options: { conflicts?: number; errors?: string[]; thrown?: boolean; duringRun?: (plugin: any) => Promise<void> } = {}) {
   const plugin = new Plugin();

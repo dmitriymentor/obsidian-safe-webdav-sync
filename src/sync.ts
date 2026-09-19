@@ -9,6 +9,8 @@ import { backupRunId } from "./backups";
 import { syncWriteOptions } from "./file-times";
 import { BackupStore, type BackupRecord } from "./backup-store";
 import type { DeletionHooks, DeleteIntent } from "./types";
+import type { NameRepair } from "./types";
+import { applyNameRepair, preserveFullTitle, shorterNotePath } from "./long-names";
 
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
 const textEncoder = new TextEncoder();
@@ -60,7 +62,8 @@ export class SyncEngine {
     state: Record<string, FileState>,
     saveState: () => Promise<void>,
     onProgress?: (progress: SyncProgress) => void,
-    private readonly deletionHooks?: DeletionHooks
+    private readonly deletionHooks?: DeletionHooks,
+    private readonly nameRepairs: NameRepair[] = []
   ) {
     this.app = app;
     this.config = config;
@@ -82,16 +85,6 @@ export class SyncEngine {
       uploaded: 0, downloaded: 0, merged: 0, conflicts: 0,
       deleted: 0, unchanged: 0, repaired: 0, errors: []
     };
-    const local = new Map<string, { file: TFile; bytes: ArrayBuffer; hash: string; mtime: number }>();
-    const localFiles = this.app.vault.getFiles().filter((file) => !shouldSkip(file.path));
-    this.progress("local", "Читаю локальные файлы", 0, localFiles.length);
-    for (let index = 0; index < localFiles.length; index++) {
-      const file = localFiles[index]!;
-      if (shouldSkip(file.path)) continue;
-      const bytes = await this.app.vault.readBinary(file);
-      local.set(file.path, { file, bytes, hash: await hashBuffer(bytes), mtime: file.stat.mtime });
-      this.progress("local", "Читаю локальные файлы", index + 1, localFiles.length, file.path);
-    }
     this.progress("remote", "Получаю список с сервера", 0, 1);
     const remote = await this.readRemoteIndex();
     if (this.deletionHooks) {
@@ -107,6 +100,18 @@ export class SyncEngine {
         `Защитная остановка: сервер вернул только ${remote.size} из ожидаемых ${expectedRemoteCount} файлов. Локальные файлы не изменены.`
       );
     }
+    const skippedNames = await this.repairLongNames(remote, dryRun, summary);
+    // Read after FileManager has renamed notes and updated their backlinks.
+    const local = new Map<string, { file: TFile; bytes: ArrayBuffer; hash: string; mtime: number }>();
+    const localFiles = this.app.vault.getFiles().filter((file) => !shouldSkip(file.path));
+    this.progress("local", "Читаю локальные файлы", 0, localFiles.length);
+    for (let index = 0; index < localFiles.length; index++) {
+      const file = localFiles[index]!;
+      if (shouldSkip(file.path)) continue;
+      const bytes = await this.app.vault.readBinary(file);
+      local.set(file.path, { file, bytes, hash: await hashBuffer(bytes), mtime: file.stat.mtime });
+      this.progress("local", "Читаю локальные файлы", index + 1, localFiles.length, file.path);
+    }
     const pending = [...(this.deletionHooks?.data.pending ?? [])];
     const deletionPaths = [...new Set([...pending.map(p => p.path), ...(this.journal?.active.keys() ?? [])])];
     const effectiveDeletions = deletionPaths.filter(p => local.has(p) || remote.has(p));
@@ -116,7 +121,7 @@ export class SyncEngine {
       }
     }
     const paths = [...new Set([...local.keys(), ...remote.keys(), ...Object.keys(this.state)])]
-      .filter(p => !deletionPaths.includes(p)).sort();
+      .filter(p => !deletionPaths.includes(p) && !skippedNames.has(p)).sort();
 
     for (let index = 0; index < paths.length; index++) {
       const path = paths[index]!;
@@ -163,6 +168,49 @@ export class SyncEngine {
       this.progress("saving", "Индекс сохранён", 1, 1);
     }
     return summary;
+  }
+
+  private async repairLongNames(remote: Map<string, RemoteEntry>, dryRun: boolean, summary: SyncSummary): Promise<Set<string>> {
+    const skipped = new Set<string>();
+    const occupied = new Set([...this.app.vault.getAllLoadedFiles().map(f => f.path), ...remote.keys(), ...Object.keys(this.state)]);
+    for (const file of this.app.vault.getFiles().filter(f => !shouldSkip(f.path))) {
+      const path = file.path;
+      try {
+        const preferred = await shorterNotePath(path, this.crypt, []);
+        if (!preferred) continue;
+        // Only never-uploadable local notes are auto-renamed. Existing remote
+        // history or deletion intents need the regular explicit rename flow.
+        if (remote.has(path) || this.state[path]?.existsRemote || this.journal?.active.has(path) ||
+            this.deletionHooks?.data.pending.some(p => p.path === path || p.renameTo === path)) {
+          throw new Error("Длинное имя связано с историей синхронизации или удаления — требуется ручное переименование");
+        }
+        const reserved = new Set(occupied);
+        const counterpart = remote.get(preferred);
+        if (counterpart && !this.app.vault.getAbstractFileByPath(preferred)) {
+          const remoteText = textDecoder.decode(await this.remoteBytes(counterpart));
+          const title = path.slice(path.lastIndexOf("/") + 1).replace(/\.(md|markdown)$/i, "");
+          // Another device may already have shortened the same original path.
+          // Require both its deterministic name and preserved complete title;
+          // normal sync then merges versions with its usual backup safeguards.
+          if (preserveFullTitle(remoteText, title) === remoteText) {
+            if (this.journal?.active.has(preferred) || this.deletionHooks?.data.pending.some(p => p.path === preferred)) {
+              throw new Error("Короткое имя связано с удалением — автоматическое переименование отложено");
+            }
+            reserved.delete(preferred);
+          }
+        }
+        const target = (await shorterNotePath(path, this.crypt, reserved))!;
+        this.progress("local", dryRun ? "Планирую сокращение имени" : "Переношу полное название в заметку", 0, 0, `${path} → ${target}`);
+        if (dryRun) skipped.add(path);
+        else await applyNameRepair(this.app, file, target, this.crypt, this.nameRepairs, this.saveState);
+        occupied.add(target);
+        summary.renamed = (summary.renamed ?? 0) + 1;
+      } catch (error) {
+        skipped.add(path);
+        summary.errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return skipped;
   }
 
   private progress(

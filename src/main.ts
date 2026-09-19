@@ -44,6 +44,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     this.data = {
       settings: { ...DEFAULT_SETTINGS, ...(loaded?.settings ?? {}) },
       state: loaded?.state ?? {},
+      nameRepairs: loaded?.nameRepairs ?? [],
       lastReport: loaded?.lastReport,
       lastErrorReport: loaded?.lastErrorReport,
       automaticSyncBlocked: loaded?.automaticSyncBlocked ?? false,
@@ -122,6 +123,12 @@ export default class SafeWebDavSyncPlugin extends Plugin {
       el.style.whiteSpace = "pre-wrap"; el.style.overflowWrap = "anywhere"; el.style.userSelect = "text";
     };
     show(latest, "Последний запуск");
+    if (this.data.nameRepairs?.length) {
+      modal.contentEl.createEl("h3", { text: "Сокращение длинных имён" });
+      const el = modal.contentEl.createEl("pre", { text: this.data.nameRepairs.map(r =>
+        `${r.completed ? "Переименовано" : "Начатая операция"}: ${r.from}\n→ ${r.to}`).join("\n\n") });
+      el.style.whiteSpace = "pre-wrap";
+    }
     const previousError = this.data.lastErrorReport;
     if (!latest.errors.length && previousError) show(previousError, "Предыдущий запуск с ошибками");
     modal.open();
@@ -185,7 +192,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
       resolveConflict: interactive ? async (path) => choose(this.app, "Файл изменён после удаления на другом устройстве", path,
         [{ value: "keep", label: "Сохранить файл — отменить удаление" },
           { value: "delete", label: "Удалить, сохранив бекап" }, { value: "later", label: "Решить позже" }], "later") : undefined
-    });
+    }, this.data.nameRepairs ??= []);
   }
 
   async restoreDeleted(): Promise<void> {
@@ -515,6 +522,6 @@ function message(error: unknown): string {
 
 function formatSummary(s: SyncSummary, dryRun: boolean): string {
   const prefix = s.errors.length ? (dryRun ? "План с ошибками" : "Завершено с ошибками") : dryRun ? "План" : "Готово";
-  const core = `${prefix}: ↑${s.uploaded} ↓${s.downloaded} объединено ${s.merged}, конфликтов ${s.conflicts}, удалено ${s.deleted}, очищено ${s.repaired ?? 0}`;
+  const core = `${prefix}: ↑${s.uploaded} ↓${s.downloaded} объединено ${s.merged}, конфликтов ${s.conflicts}, удалено ${s.deleted}, очищено ${s.repaired ?? 0}${s.renamed ? `, сокращено имён ${s.renamed}` : ""}`;
   return s.errors.length ? `${core}. Ошибок: ${s.errors.length}` : core;
 }

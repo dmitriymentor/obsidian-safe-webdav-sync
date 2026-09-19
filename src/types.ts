@@ -29,12 +29,21 @@ export interface FileState {
 }
 
 export interface PersistedData {
+  nameRepairs?: NameRepair[];
   lastReport?: SyncReport;
   lastErrorReport?: SyncReport;
   automaticSyncBlocked?: boolean;
   deletionState?: DeletionState;
   settings: PluginSettings;
   state: Record<string, FileState>;
+}
+
+export interface NameRepair {
+  from: string;
+  to: string;
+  backupPath: string;
+  at: string;
+  completed: boolean;
 }
 
 export interface SyncReport {
@@ -79,6 +88,7 @@ export interface RemoteEntry {
 }
 
 export interface SyncSummary {
+  renamed?: number;
   repaired: number;
   uploaded: number;
   downloaded: number;

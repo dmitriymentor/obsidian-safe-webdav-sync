@@ -84,6 +84,24 @@ publishing credentials.
 
 ## Installation
 
+Version 0.2.8 automatically shortens overlong Markdown filenames that have never
+been uploaded, after checking the remote index and before reading local content.
+It first retains the complete original title as a heading after YAML frontmatter,
+without truncating existing content. The shorter filename keeps its extension
+and a deterministic path-hash suffix, is checked using actual Rclone encryption,
+and never overwrites a local destination. Normal names stay unchanged. A remote
+counterpart with the same deterministic name and complete heading is reconciled
+by normal sync; unrelated occupied names get another suffix.
+
+Before changing a note, a verified encrypted original is retained locally in
+`.safe-sync-name-repairs/`; the original path, destination and backup location are
+persisted in plugin data (`nameRepairs`) and shown in the last-report window.
+Keep both the hidden archive and plugin data in device backups. YAML dates are
+not rewritten, and file times use the existing date-preservation logic. Obsidian's
+FileManager performs the rename and honors the user's automatic link-update
+preference. Dry runs do not rename or write. Already-synced/deletion-tracked long
+paths, overlong folder names and binary attachments still require manual action.
+
 Version 0.2.7 bypasses native HTTP response caches on all object reads, including
 post-write verification, archives, journal reads and weak-validator retries.
 Each GET has a unique query and no-cache/no-store headers; object paths and write
