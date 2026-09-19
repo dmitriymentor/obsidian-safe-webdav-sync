@@ -3,7 +3,7 @@ import { RcloneCrypto } from "./crypto";
 import { mergeMarkdown, type MergeTimes } from "./merge";
 import { hasLegacyConflicts, planLegacyRepair, repairLegacyConflicts } from "./repair";
 import type { FileState, ImportedConfig, RemoteEntry, SyncProgress, SyncSummary } from "./types";
-import { WebDav, type RawRemoteEntry } from "./webdav";
+import { WebDav, isStrongEtag, type RawRemoteEntry } from "./webdav";
 import { DeletionJournal, JOURNAL, deletionConflicts, needsMassConfirmation, userPath } from "./deletions";
 import { backupRunId } from "./backups";
 import { syncWriteOptions } from "./file-times";
@@ -345,12 +345,14 @@ export class SyncEngine {
       await assertLocalUnchanged();
       const changesLocal = !local || local.hash !== hash;
       const changesRemote = !remoteBytes || await hashBuffer(remoteBytes) !== hash;
+      // Fail before creating archives when this repair cannot be committed.
+      if (changesRemote && object && !isStrongEtag(object.etag)) {
+        const reason = !object.etag ? "заголовок отсутствует или неоднозначен" : object.etag.startsWith("W/") ? "сервер вернул слабый ETag" : "некорректный формат заголовка";
+        throw new Error(`Нет надёжного ETag для безопасного исправления (${reason})`);
+      }
       if (changesLocal || changesRemote) await this.backupBoth(path, local?.bytes, remoteBytes);
       await assertLocalUnchanged();
       if (changesRemote) {
-        if (object && (!object.etag.startsWith('"') || object.etag.startsWith("W/"))) {
-          throw new Error("Нет надёжного ETag для безопасного исправления");
-        }
         await this.webdav.put(encryptedPath, await this.crypt.encrypt(bytes), object
           ? { "If-Match": object.etag } : { "If-None-Match": "*" });
       }

@@ -86,6 +86,7 @@ test("background sync errors remain visible", async () => {
   await notificationFixture({ errors: ["note.md: HTTP 503"] }).sync(false, "по расписанию");
   assert.equal(notices.length, 1);
   assert.match(notices[0]!, /Ошибок: 1/);
+  assert.match(notices[0]!, /^Завершено с ошибками:/);
   notices.length = 0;
   await notificationFixture({ thrown: true }).sync(false, "после сохранения");
   assert.equal(notices.length, 1);
@@ -269,6 +270,18 @@ test("migration uses the validator of the actual read and stops on conditional w
   await assert.rejects(f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], false, f.summary), /412/);
   assert.equal(new TextDecoder().decode(f.files.get("note.md")!.bytes), f.dirty);
   assert.equal(f.state["note.md"].baseText, f.dirty);
+});
+
+test("missing, weak or malformed ETags stop remote repair before any backup is created", async () => {
+  for (const etag of ["", 'W/"weak"', '"unterminated', '"one", "two"']) {
+    const f = await legacyFixture();
+    f.remote.get("note.md")!.bytes = buffer(f.dirty);
+    f.remote.get("note.md")!.etag = etag;
+    await assert.rejects(f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], false, f.summary), /Нет надёжного ETag/);
+    assert.equal(f.archive.size, 0); assert.equal(f.remote.size, 1);
+    assert.equal(new TextDecoder().decode(f.files.get("note.md")!.bytes), f.dirty);
+    assert.equal(f.state["note.md"].baseText, f.dirty);
+  }
 });
 
 test("migration verifies the remote again even when the clean server needs no write", async () => {

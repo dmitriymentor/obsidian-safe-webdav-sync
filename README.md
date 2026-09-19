@@ -84,6 +84,14 @@ publishing credentials.
 
 ## Installation
 
+Version 0.2.6 reads GET/PUT ETag headers case-insensitively (including `Etag`)
+and trims surrounding whitespace. Conflicting header values fail closed. Weak
+validators still trigger a fresh-read retry, never conversion into strong ones.
+Conditional repair/deletion require a complete strong quoted validator. A repair
+with an unusable validator now stops before making backups and explains whether
+the header is missing/ambiguous, weak or malformed. Failed runs are labeled as
+errors, not "Готово". No concurrency protection or If-Match condition is removed.
+
 Version 0.2.5 protects new backup contents from Markdown plugins. They are
 encrypted with the existing vault encryption password and written via the data
 adapter as hidden `.safe-sync-backups/v1` binary objects. Local JSON metadata

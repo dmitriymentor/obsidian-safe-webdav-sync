@@ -369,7 +369,7 @@ class SyncProgressModal extends Modal {
     this.titleEl.setText(errors.length ? "Синхронизация завершена с ошибками" : "Синхронизация завершена");
     this.phaseEl.setText(report);
     this.progressEl.value = 100;
-    this.countEl.setText("100%");
+    this.countEl.setText(errors.length ? "Проверка завершена · Есть ошибки" : "100%");
     this.pathEl.setText(errors.length ? errors.slice(0, 3).join("\n") : "Все файлы обработаны.");
     this.addCloseButton();
   }
@@ -514,7 +514,7 @@ function message(error: unknown): string {
 }
 
 function formatSummary(s: SyncSummary, dryRun: boolean): string {
-  const prefix = dryRun ? "План" : "Готово";
+  const prefix = s.errors.length ? (dryRun ? "План с ошибками" : "Завершено с ошибками") : dryRun ? "План" : "Готово";
   const core = `${prefix}: ↑${s.uploaded} ↓${s.downloaded} объединено ${s.merged}, конфликтов ${s.conflicts}, удалено ${s.deleted}, очищено ${s.repaired ?? 0}`;
   return s.errors.length ? `${core}. Ошибок: ${s.errors.length}` : core;
 }

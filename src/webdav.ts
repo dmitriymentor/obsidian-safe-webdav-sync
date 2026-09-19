@@ -18,6 +18,18 @@ function encodePath(path: string): string {
   return path.split("/").filter(Boolean).map(encodeURIComponent).join("/");
 }
 
+// Native and desktop transports can use different casing for HTTP fields.
+// Ambiguous duplicate values must not become a write precondition.
+export function responseHeader(headers: Record<string, string>, name: string): string {
+  const values = Object.entries(headers).filter(([key]) => key.toLowerCase() === name.toLowerCase())
+    .map(([, value]) => typeof value === "string" ? value.trim() : "");
+  return values.length && new Set(values).size === 1 ? values[0]! : "";
+}
+
+export function isStrongEtag(value: string): boolean {
+  return /^"[\x21\x23-\x7E\x80-\xFF]*"$/.test(value);
+}
+
 export class WebDav {
   private readonly address: string;
   private readonly rootUrl: string;
@@ -126,7 +138,7 @@ export class WebDav {
     const response = await requestUrl({ url: this.url(encryptedPath), method: "GET", headers: { Authorization: this.auth, "Accept-Encoding": "identity" }, throw: false });
     if (response.status === 404) return undefined;
     if (response.status !== 200) throw new Error(`WebDAV GET: HTTP ${response.status}`);
-    const etag = response.headers.etag ?? response.headers.ETag ?? "";
+    const etag = responseHeader(response.headers, "etag");
     // Apache can emit a weak validator during the first second after a write.
     // Re-read the bytes as well as the validator; never strip W/ and pretend.
     if (retryWeak && etag.startsWith("W/")) {
@@ -137,7 +149,7 @@ export class WebDav {
   }
 
   async removeIfMatch(encryptedPath: string, etag: string): Promise<void> {
-    if (!etag.startsWith('"') || etag.startsWith("W/")) throw new Error("Удаление требует надёжного ETag сервера");
+    if (!isStrongEtag(etag)) throw new Error("Удаление требует надёжного ETag сервера");
     const response = await requestUrl({ url: this.url(encryptedPath), method: "DELETE", headers: { Authorization: this.auth, "If-Match": etag }, throw: false });
     if (![200, 204, 404].includes(response.status)) throw new Error(`WebDAV DELETE: HTTP ${response.status}; файл не удалён`);
   }
@@ -165,7 +177,7 @@ export class WebDav {
     const response = await this.request("PUT", this.url(encryptedPath), data, {
       "Content-Type": "application/octet-stream", ...conditions
     });
-    return response.headers.etag ?? response.headers.ETag ?? "";
+    return responseHeader(response.headers, "etag");
   }
 
   async move(fromEncryptedPath: string, toEncryptedPath: string): Promise<void> {

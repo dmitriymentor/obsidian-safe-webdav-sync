@@ -61,3 +61,40 @@ test("a failed directory aborts the entire index and drains outstanding requests
   assert.equal(f.calls.includes("e"), false);
   assert.equal(f.calls.includes("a/sub"), false);
 });
+
+function objectFixture(requestUrl: (args: any) => Promise<any>) {
+  const module = { exports: {} as any };
+  const delays: number[] = [];
+  runInNewContext(code, { module, exports: module.exports, require: () => ({ requestUrl }), DOMParser, URL,
+    setTimeout: (callback: () => void, delay: number) => { delays.push(delay); callback(); } });
+  return { webdav: new module.exports.WebDav("https://example.test", "user", "pass", "vault"), delays };
+}
+test("GET and PUT accept all HTTP header casing, including Etag used by native transports", async () => {
+  for (const name of ["etag", "ETag", "Etag", "ETAG", "eTaG"]) {
+    const content = new TextEncoder().encode("current bytes").buffer;
+    const f = objectFixture(async args => ({ status: args.method === "PUT" ? 201 : 200, headers: { [name]: '  "revision"  ' }, arrayBuffer: content }));
+    assert.equal((await f.webdav.getObject("note.md")).etag, '"revision"');
+    assert.equal(await f.webdav.put("note.md", content), '"revision"');
+  }
+});
+test("native-cased weak Etag retries fresh bytes, never upgrades a weak validator", async () => {
+  let reads = 0;
+  const f = objectFixture(async () => ({ status: 200, headers: { Etag: ++reads === 1 ? 'W/"old"' : '"fresh"' }, arrayBuffer: new TextEncoder().encode(String(reads)).buffer }));
+  const object = await f.webdav.getObject("note.md");
+  assert.equal(reads, 2); assert.equal(object.etag, '"fresh"');
+  assert.equal(new TextDecoder().decode(object.bytes), "2"); assert.deepEqual(f.delays, [1500]);
+  const weak = objectFixture(async () => ({ status: 200, headers: { Etag: 'W/"weak"' }, arrayBuffer: new ArrayBuffer(0) }));
+  assert.equal((await weak.webdav.getObject("note.md")).etag, 'W/"weak"');
+  await assert.rejects(weak.webdav.removeIfMatch("note.md", 'W/"weak"'), /ETag/);
+});
+test("missing and contradictory ETag headers cannot authorize a conditional deletion", async () => {
+  for (const headers of [{}, { Etag: '"one"', etag: '"two"' }]) {
+    const f = objectFixture(async args => {
+      assert.equal(args.method, "GET");
+      return { status: 200, headers, arrayBuffer: new ArrayBuffer(0) };
+    });
+    const object = await f.webdav.getObject("note.md");
+    assert.equal(object.etag, "");
+    await assert.rejects(f.webdav.removeIfMatch("note.md", object.etag), /ETag/);
+  }
+});
