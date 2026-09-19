@@ -98,3 +98,59 @@ test("missing and contradictory ETag headers cannot authorize a conditional dele
     await assert.rejects(f.webdav.removeIfMatch("note.md", object.etag), /ETag/);
   }
 });
+
+test("all GETs bypass stale native caches after PUT and keep validators paired with bytes", async () => {
+  const old = new TextEncoder().encode("old").buffer;
+  const fresh = new TextEncoder().encode("fresh").buffer;
+  let server = old, revision = '"old"';
+  const cache = new Map<string, any>();
+  const reads: string[] = [];
+  const f = objectFixture(async args => {
+    const url = new URL(args.url);
+    assert.equal(url.pathname, "/vault/note.md");
+    if (args.method === "GET") {
+      assert.equal(args.headers["Cache-Control"], "no-cache, no-store, max-age=0");
+      assert.equal(args.headers.Pragma, "no-cache");
+      assert.ok(url.searchParams.get("safe-sync-read"));
+      reads.push(args.url);
+      // Model a native cache that ignores headers and retains pre-PUT bodies.
+      if (!cache.has(args.url)) cache.set(args.url, { status: 200, headers: { Etag: revision }, arrayBuffer: server });
+      return cache.get(args.url);
+    }
+    assert.equal(url.search, "");
+    assert.equal(args.method, "PUT");
+    assert.equal(args.headers["If-Match"], revision);
+    server = args.body; revision = '"fresh"';
+    return { status: 204, headers: { Etag: revision } };
+  });
+  const before = await f.webdav.getObject("note.md");
+  assert.equal(new TextDecoder().decode(before.bytes), "old");
+  await f.webdav.put("note.md", fresh, { "If-Match": before.etag });
+  const after = await f.webdav.getObject("note.md");
+  assert.equal(new TextDecoder().decode(after.bytes), "fresh");
+  assert.equal(after.etag, '"fresh"');
+  assert.equal(new TextDecoder().decode(await f.webdav.get("note.md")), "fresh");
+  assert.equal(new Set(reads).size, 3);
+});
+
+test("weak validator retries also use distinct cache keys", async () => {
+  const urls: string[] = [];
+  const f = objectFixture(async args => {
+    urls.push(args.url);
+    return { status: 200, headers: { Etag: urls.length === 1 ? 'W/"one"' : '"two"' }, arrayBuffer: new ArrayBuffer(0) };
+  });
+  assert.equal((await f.webdav.getObject("note.md")).etag, '"two"');
+  assert.equal(new Set(urls).size, 2);
+});
+
+test("unexpected 304 is not accepted as an object or retried as an unconditional write", async () => {
+  const f = objectFixture(async args => { assert.equal(args.method, "GET"); return { status: 304, headers: {} }; });
+  await assert.rejects(f.webdav.getObject("note.md"), /HTTP 304/);
+  await assert.rejects(f.webdav.get("note.md"), /HTTP 304/);
+});
+
+test("overlong encrypted names fail clearly before creating directories or uploading", async () => {
+  const f = objectFixture(async () => { assert.fail("no network request should be made"); });
+  await assert.rejects(f.webdav.put("folder/" + "a".repeat(256), new ArrayBuffer(0)), /Слишком длинное имя/);
+  await assert.rejects(f.webdav.get("я".repeat(128)), /255 байт/);
+});

@@ -360,7 +360,7 @@ export class SyncEngine {
       // while we were creating the backups. Never install an unverified base.
       const verified = await this.webdav.getObject(encryptedPath);
       if (!verified || await hashBuffer(await this.crypt.decrypt(verified.bytes)) !== hash) {
-        throw new Error("Сервер изменился после исправления — локальная версия сохранена");
+        throw new Error("Контрольное чтение не подтвердило исправление на сервере — локальная версия сохранена");
       }
       await assertLocalUnchanged();
       if (changesLocal) await this.writeLocal(path, bytes, Math.max(local?.mtime ?? 0, remote?.mtime ?? 0));

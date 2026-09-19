@@ -34,6 +34,8 @@ export class WebDav {
   private readonly address: string;
   private readonly rootUrl: string;
   private readonly auth: string;
+  private readonly readSession = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  private readSequence = 0;
 
   constructor(address: string, username: string, password: string, remoteBaseDir: string) {
     this.address = address.replace(/\/+$/, "");
@@ -43,9 +45,19 @@ export class WebDav {
   }
 
   private url(encryptedPath = "", directory = false): string {
+    if (encryptedPath.split("/").some(part => Buffer.byteLength(part, "utf8") > 255)) {
+      throw new Error("Слишком длинное имя после шифрования (более 255 байт). Сократите название заметки или папки; локальный файл сохранён");
+    }
     const encoded = encodePath(encryptedPath);
     if (!encoded) return this.rootUrl;
     return `${this.rootUrl}${encoded}${directory ? "/" : ""}`;
+  }
+
+  private freshReadUrl(encryptedPath: string): string {
+    // iOS requestUrl may serve a cached body without reaching WebDAV, including
+    // after PUT. A unique read-only query also bypasses already cached responses
+    // whose original headers allowed caching. It never changes the object path.
+    return `${this.url(encryptedPath)}?safe-sync-read=${this.readSession}-${++this.readSequence}`;
   }
 
   private async request(
@@ -131,11 +143,16 @@ export class WebDav {
   }
 
   async get(encryptedPath: string): Promise<ArrayBuffer> {
-    return (await this.request("GET", this.url(encryptedPath))).arrayBuffer;
+    const object = await this.getObject(encryptedPath, false);
+    if (!object) throw new Error("WebDAV GET: HTTP 404");
+    return object.bytes;
   }
 
   async getObject(encryptedPath: string, retryWeak = true): Promise<{ bytes: ArrayBuffer; etag: string } | undefined> {
-    const response = await requestUrl({ url: this.url(encryptedPath), method: "GET", headers: { Authorization: this.auth, "Accept-Encoding": "identity" }, throw: false });
+    const response = await requestUrl({ url: this.freshReadUrl(encryptedPath), method: "GET", headers: {
+      Authorization: this.auth, "Accept-Encoding": "identity",
+      "Cache-Control": "no-cache, no-store, max-age=0", Pragma: "no-cache"
+    }, throw: false });
     if (response.status === 404) return undefined;
     if (response.status !== 200) throw new Error(`WebDAV GET: HTTP ${response.status}`);
     const etag = responseHeader(response.headers, "etag");
@@ -155,6 +172,7 @@ export class WebDav {
   }
 
   async ensureParents(encryptedPath: string): Promise<void> {
+    this.url(encryptedPath); // Validate the whole path before creating anything.
     const parts = encryptedPath.split("/").filter(Boolean);
     parts.pop();
     let current = "";

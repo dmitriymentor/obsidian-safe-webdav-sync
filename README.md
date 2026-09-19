@@ -84,6 +84,14 @@ publishing credentials.
 
 ## Installation
 
+Version 0.2.7 bypasses native HTTP response caches on all object reads, including
+post-write verification, archives, journal reads and weak-validator retries.
+Each GET has a unique query and no-cache/no-store headers; object paths and write
+conditions are unchanged. Unexpected or mismatched verification still stops
+the operation without replacing the local note. Encrypted path components over
+255 bytes are rejected with an actionable rename message before network writes.
+No notes or archives are automatically renamed, removed or migrated.
+
 Version 0.2.6 reads GET/PUT ETag headers case-insensitively (including `Etag`)
 and trims surrounding whitespace. Conflicting header values fail closed. Weak
 validators still trigger a fresh-read retry, never conversion into strong ones.

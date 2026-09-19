@@ -292,7 +292,7 @@ test("migration verifies the remote again even when the clean server needs no wr
     if (p === "note.md" && ++reads > 1) return { bytes: buffer("concurrent edit"), etag: '"changed"' };
     return get(p);
   };
-  await assert.rejects(f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], false, f.summary), /Сервер изменился/);
+  await assert.rejects(f.engine.tryLegacyRepair("note.md", f.local, f.entry, f.state["note.md"], false, f.summary), /Контрольное чтение/);
   assert.equal(new TextDecoder().decode(f.files.get("note.md")!.bytes), f.dirty);
 });
 
