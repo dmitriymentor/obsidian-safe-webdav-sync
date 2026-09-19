@@ -212,7 +212,12 @@ export class SyncEngine {
     summary: SyncSummary
   ): Promise<void> {
     const previous = this.state[path];
-    if (isMarkdown(path) && await this.tryLegacyRepair(path, local, remote, previous, dryRun, summary)) return;
+    let inspectedRemote: ArrayBuffer | undefined;
+    if (isMarkdown(path) && await this.tryLegacyRepair(path, local, remote, previous, dryRun, summary,
+      (bytes) => { inspectedRemote = bytes; })) return;
+    // The legacy check may already have downloaded this exact object. Reuse it
+    // only for this file/operation; repair verification and deletion stay fresh.
+    const readRemote = async (entry: RemoteEntry) => inspectedRemote ?? this.remoteBytes(entry);
     if (!local && !remote) {
       if (!dryRun) delete this.state[path];
       return;
@@ -224,14 +229,14 @@ export class SyncEngine {
         return;
       }
       if (!local && remote) {
-        const bytes = await this.remoteBytes(remote);
+        const bytes = await readRemote(remote);
         if (!dryRun) await this.writeLocal(path, bytes, remote.mtime);
         if (!dryRun) this.state[path] = this.makeState(bytes, await hashBuffer(bytes), remote.etag);
         summary.downloaded++;
         return;
       }
       if (local && remote) {
-        const rbytes = await this.remoteBytes(remote);
+        const rbytes = await readRemote(remote);
         const rhash = await hashBuffer(rbytes);
         if (local.hash === rhash) {
           if (!dryRun) this.state[path] = this.makeState(local.bytes, local.hash, remote.etag);
@@ -245,7 +250,7 @@ export class SyncEngine {
     }
 
     if (!local && remote) {
-      const rbytes = await this.remoteBytes(remote);
+      const rbytes = await readRemote(remote);
       const rhash = await hashBuffer(rbytes);
       // A missing local file can be an incomplete mobile listing or an app-side
       // move. Restore from the encrypted server instead of deleting remotely.
@@ -271,7 +276,7 @@ export class SyncEngine {
     let rbytes: ArrayBuffer | undefined;
     let rhash = previous.baseHash;
     if (remoteChanged) {
-      rbytes = await this.remoteBytes(r);
+      rbytes = await readRemote(r);
       rhash = await hashBuffer(rbytes);
       remoteChanged = rhash !== previous.baseHash;
     }
@@ -283,12 +288,12 @@ export class SyncEngine {
       if (!dryRun) this.state[path] = await this.uploadAndState(path, l.bytes, l.hash);
       summary.uploaded++;
     } else if (!localChanged && remoteChanged) {
-      rbytes ??= await this.remoteBytes(r);
+      rbytes ??= await readRemote(r);
       if (!dryRun) await this.writeLocal(path, rbytes, r.mtime);
       if (!dryRun) this.state[path] = this.makeState(rbytes, rhash, r.etag);
       summary.downloaded++;
     } else {
-      rbytes ??= await this.remoteBytes(r);
+      rbytes ??= await readRemote(r);
       await this.resolveBothChanged(path, l.bytes, rbytes, previous.baseText ?? "", dryRun, summary,
         { localMtime: l.mtime, remoteMtime: r.mtime });
     }
@@ -300,7 +305,8 @@ export class SyncEngine {
     remote: RemoteEntry | undefined,
     previous: FileState | undefined,
     dryRun: boolean,
-    summary: SyncSummary
+    summary: SyncSummary,
+    onInspected?: (bytes: ArrayBuffer) => void
   ): Promise<boolean> {
     const localText = local ? textDecoder.decode(local.bytes) : "";
     const base = previous?.baseText ?? "";
@@ -311,7 +317,15 @@ export class SyncEngine {
     if (remote && !object) throw new Error("Файл изменился на сервере во время проверки старых конфликтов");
     const remoteBytes = object ? await this.crypt.decrypt(object.bytes) : undefined;
     const remoteText = remoteBytes ? textDecoder.decode(remoteBytes) : "";
-    if (![localText, base, remoteText].some(hasLegacyConflicts)) return false;
+    if (![localText, base, remoteText].some(hasLegacyConflicts)) {
+      if (remote && object && remoteBytes) {
+        // Pair the reused bytes with the validator from their own GET, not a
+        // possibly older directory listing. Nothing persists across runs.
+        remote.etag = object.etag || remote.etag;
+        onInspected?.(remoteBytes);
+      }
+      return false;
+    }
     if (!local && !object) return false;
     const repair = local && object
       ? planLegacyRepair(localText, base, remoteText, { localMtime: local.mtime, remoteMtime: remote?.mtime ?? 0 })!

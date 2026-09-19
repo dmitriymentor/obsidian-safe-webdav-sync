@@ -1,0 +1,63 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { buildSync } from "esbuild";
+import { runInNewContext } from "node:vm";
+
+const code = buildSync({ entryPoints: ["src/webdav.ts"], bundle: true, write: false, format: "cjs", platform: "browser", external: ["obsidian"] }).outputFiles[0]!.text;
+type Node = { name: string; text?: string; children?: Node[] };
+class Element {
+  constructor(private node: Node) {}
+  get textContent() { return this.node.text ?? ""; }
+  getElementsByTagNameNS(_namespace: string, name: string) { return this.getElementsByTagName(name); }
+  getElementsByTagName(name: string) {
+    const out: Element[] & { item?: (n: number) => Element | null } = [];
+    const visit = (node: Node) => { for (const child of node.children ?? []) { if (child.name === name) out.push(new Element(child)); visit(child); } };
+    visit(this.node); out.item = n => out[n] ?? null; return out;
+  }
+}
+class DOMParser { parseFromString(s: string) { return new Element(JSON.parse(s)); } }
+function response(paths: string[]) {
+  return JSON.stringify({ name: "document", children: [{ name: "multistatus", children: paths.map(p => ({ name: "response", children: [
+    { name: "href", text: "/vault/" + p }, { name: "getetag", text: '"etag"' },
+    { name: "getcontentlength", text: "123" }, { name: "getlastmodified", text: "Sat, 19 Sep 2026 10:00:00 GMT" },
+    ...(p.endsWith("/") ? [{ name: "collection" }] : [])
+  ] })) }] });
+}
+function fixture(fail?: string) {
+  const graph: Record<string, string[]> = { "": ["a/", "b/", "c/", "d/", "e/", "excluded/", "root.md"],
+    a: ["a/", "a/sub/", "a/note.md"], b: ["b/", "a/sub/", "b/note.md"], c: ["c/note.md"], d: [], e: [], "a/sub": ["a/sub/deep.md"] };
+  let active = 0, maximum = 0;
+  const calls: string[] = [];
+  const requestUrl = async (args: any) => {
+    assert.equal(args.method, "PROPFIND"); assert.equal(args.headers.Depth, "1");
+    const p = new URL(args.url).pathname.replace(/^\/vault\//, "").replace(/\/$/, "");
+    calls.push(p); active++; maximum = Math.max(maximum, active);
+    try { await new Promise(r => setTimeout(r, p === fail ? 1 : 8)); return { status: p === fail ? 503 : 207, text: response(graph[p] ?? []) }; }
+    finally { active--; }
+  };
+  const module = { exports: {} as any };
+  runInNewContext(code, { module, exports: module.exports, require: () => ({ requestUrl }), DOMParser, URL, setTimeout });
+  const webdav = new module.exports.WebDav("https://example.test", "user", "pass", "vault");
+  return { webdav, calls, active: () => active, maximum: () => maximum };
+}
+test("directory listing scans the complete tree with at most four concurrent reads", async () => {
+  const f = fixture(), progress: [number, number][] = [];
+  const result = await f.webdav.list((done: number, total: number) => progress.push([done, total]), async (p: string) => p !== "excluded");
+  assert.equal(f.maximum(), 4);
+  assert.equal(f.active(), 0);
+  assert.equal(f.calls.length, 7);
+  assert.equal(new Set(f.calls).size, 7);
+  assert.equal(f.calls.includes("excluded"), false);
+  assert.ok(result.some((e: any) => e.encryptedPath === "a/sub/deep.md"));
+  assert.ok(result.some((e: any) => e.encryptedPath === "b/note.md"));
+  assert.deepEqual(progress.map(p => p[0]), [1, 2, 3, 4, 5, 6, 7]);
+  assert.ok(progress.every(([done, total]) => done <= total));
+  assert.deepEqual(progress.at(-1), [7, 7]);
+});
+test("a failed directory aborts the entire index and drains outstanding requests", async () => {
+  const f = fixture("a");
+  await assert.rejects(f.webdav.list(undefined, async (p: string) => p !== "excluded"), /503/);
+  assert.equal(f.active(), 0);
+  assert.equal(f.calls.includes("e"), false);
+  assert.equal(f.calls.includes("a/sub"), false);
+});

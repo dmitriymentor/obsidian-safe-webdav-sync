@@ -67,10 +67,8 @@ export class WebDav {
     const found = new Map<string, RawRemoteEntry>();
     const queue = [""];
     const visited = new Set<string>();
-    while (queue.length) {
-      const current = queue.shift()!;
-      if (visited.has(current)) continue;
-      visited.add(current);
+    let completed = 0;
+    const scan = async (current: string): Promise<void> => {
       const response = await this.request("PROPFIND", this.url(current, true), PROPFIND_BODY, {
         Depth: "1",
         "Content-Type": "application/xml; charset=utf-8"
@@ -98,9 +96,24 @@ export class WebDav {
           etag: xmlText(row, "getetag")
         };
         found.set(relative, entry);
-        if (isDirectory && (!includeDirectory || await includeDirectory(relative))) queue.push(relative);
+        if (isDirectory && !visited.has(relative) && (!includeDirectory || await includeDirectory(relative))) queue.push(relative);
       }
-      onProgress?.(visited.size, visited.size + queue.length);
+      completed++;
+      onProgress?.(completed, visited.size + queue.length);
+    };
+    while (queue.length) {
+      const batch: string[] = [];
+      while (queue.length && batch.length < 4) {
+        const current = queue.shift()!;
+        if (visited.has(current)) continue;
+        visited.add(current);
+        batch.push(current);
+      }
+      // Only metadata reads are parallel. Drain the batch on failure and never
+      // return a partial index that could be mistaken for missing files.
+      const results = await Promise.allSettled(batch.map(scan));
+      const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failed) throw failed.reason;
     }
     return [...found.values()];
   }

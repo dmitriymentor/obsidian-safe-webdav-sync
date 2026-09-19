@@ -141,6 +141,49 @@ test("identical local writes do not touch mtime or emit modify", async () => {
   await f.engine.writeLocal("note.md", f.files.get("note.md")!.bytes, Date.now());
 });
 
+test("legacy inspection reuses clean remote bytes and their GET validator only within one operation", async () => {
+  const f = await deletionFixture();
+  const old = f.files.get("note.md")!.bytes;
+  Object.assign(f.state["note.md"], { baseText: "old content", remoteFingerprint: '"old"' });
+  let reads = 0;
+  f.engine.webdav.get = async () => { throw Error("duplicate GET"); };
+  f.engine.webdav.getObject = async () => { reads++; return { bytes: old, etag: '"actual-get"' }; };
+  const local = { file: f.files.get("note.md")!.file, bytes: old, hash: await digest(old), mtime: 1 };
+  const entry = { encryptedPath: "note.md", etag: '"listing"', mtime: 2 };
+  const summary = { unchanged: 0 };
+  await f.engine.syncOne("note.md", local, { ...entry }, false, summary);
+  assert.equal(reads, 1);
+  assert.equal(summary.unchanged, 1);
+  assert.equal(f.state["note.md"].remoteFingerprint, '"actual-get"');
+  // A later operation must consult the server again, not reuse the old body.
+  const changed = buffer("edited on the other device");
+  f.engine.webdav.getObject = async () => { reads++; return { bytes: changed, etag: '"new-get"' }; };
+  const later = { downloaded: 0 };
+  await f.engine.syncOne("note.md", local, { ...entry, etag: '"new-listing"' }, false, later);
+  assert.equal(reads, 2);
+  assert.equal(later.downloaded, 1);
+  assert.equal(new TextDecoder().decode(f.files.get("note.md")!.bytes), "edited on the other device");
+  assert.equal(f.state["note.md"].remoteFingerprint, '"new-get"');
+});
+
+test("first-contact comparisons and downloads reuse inspection without modifying a dry run", async () => {
+  for (const hasLocal of [true, false]) {
+    const f = await deletionFixture();
+    delete f.state["note.md"];
+    const bytes = f.files.get("note.md")!.bytes;
+    let reads = 0;
+    f.engine.webdav.get = async () => { throw Error("duplicate GET"); };
+    f.engine.webdav.getObject = async () => { reads++; return { bytes, etag: '"get"' }; };
+    const local = hasLocal ? { file: f.files.get("note.md")!.file, bytes, hash: await digest(bytes), mtime: 1 } : undefined;
+    const summary = { unchanged: 0, downloaded: 0 };
+    await f.engine.syncOne("note.md", local, { encryptedPath: "note.md", etag: '"list"', mtime: 2 }, true, summary);
+    assert.equal(reads, 1);
+    assert.equal(summary[hasLocal ? "unchanged" : "downloaded"], 1);
+    assert.equal(f.state["note.md"], undefined);
+    assert.equal(f.files.size, 1);
+  }
+});
+
 test("downloaded and merged notes retain their author dates while real edits can advance them", async () => {
   const f = await deletionFixture();
   const stamp = Date.parse("2026-08-01T10:00");

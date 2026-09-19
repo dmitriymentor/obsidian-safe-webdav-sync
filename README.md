@@ -83,6 +83,17 @@ publishing credentials.
 
 ## Installation
 
+Version 0.2.4 scans up to four server directories concurrently and reuses the
+clean remote body already fetched for legacy-conflict inspection within that
+single file operation. The reused body retains its own GET validator. Remote
+data is never cached across runs; post-repair verification is still a fresh
+read. A failed directory aborts the whole listing after pending reads drain.
+Every run still checks all local files, the server tree and deletion journal.
+There is no change to encryption, server format, conflict or deletion rules.
+Local caching was deferred: measurements on the development vault showed local
+reading/hashing under 0.1 seconds; network latency dominated. Speedups depend
+on network conditions and the number of changed remote fingerprints.
+
 Install with BRAT from this repository, then disable the original Remotely Save
 plugin. Safe WebDAV Sync reads its settings file locally, so no password is
 stored in this repository.
