@@ -218,3 +218,42 @@ starts synchronization automatically; existing-journal restrictions still apply.
 
 Production build completed. No tests were run at the user's request. Camera and
 protocol-link behavior on the iPhone must be confirmed on the device.
+
+## Mobile plugin compatibility and navigation (0.3.3)
+
+Obsidian community plugins generally distribute one package for desktop and
+mobile. `isDesktopOnly` controls mobile compatibility; `minAppVersion` controls
+the required Obsidian version. Synchronizing an installed package does not
+select a separate mobile edition or fetch the latest store version. Update
+community plugins through Obsidian's store and sync the resulting files.
+
+On mobile, shared settings now validate plugin manifests and the available
+Obsidian API version before copying plugin files. The enabled-plugin list is
+processed after the files. Only compatible plugins with a local manifest and
+main.js can enter that list; a failed binary transfer excludes that plugin.
+Desktop-only integrations and unavailable plugins are excluded on the phone,
+while their server enable-list entries are retained on mobile uploads. Legacy
+manifests without an explicit minimum version remain supported.
+
+Workspace layouts remain device-local. Third-party plugin source and defaults
+are unchanged. New enabled plugins with no existing settings are initialized
+through Obsidian's user-initiated enable pipeline **before** their shared
+`data.json` is imported. The pipeline awaits normal plugin loading and calls its
+own `onUserEnable` hook, as store installation does; no specific plugin command,
+view type or settings key is used.
+
+First-install intent and completion are recorded locally in Safe Sync data,
+which is excluded from shared settings. Failed initialization blocks that
+plugin's settings import and reports an error. Plugin defaults created during
+initialization are backed up before shared preferences replace them. Existing
+plugins and their workspace layout are not reset. After synchronization, restart
+Obsidian to apply the imported preferences. Plugins with additional onboarding
+prompts can still require the user's normal responses.
+
+The implementation uses Obsidian's internal plugin manager, inspected in the
+installed 1.14.4 app. If required methods are unavailable, settings import for
+the new plugin is paused with instructions to enable it in Obsidian's settings.
+There is no generic official public API for store-style community plugin setup.
+
+Production build completed; no tests were run at the user's request. Mobile
+compatibility filtering and first-install initialization still need confirmation on iPhone.

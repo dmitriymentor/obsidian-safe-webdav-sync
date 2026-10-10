@@ -49,6 +49,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
       settings: { ...DEFAULT_SETTINGS, ...(loaded?.settings ?? {}) },
       state: loaded?.state ?? {},
       configState: loaded?.configState ?? {},
+      pluginSetup: loaded?.pluginSetup ?? {},
       nameRepairs: loaded?.nameRepairs ?? [],
       lastReport: loaded?.lastReport,
       lastErrorReport: loaded?.lastErrorReport,
@@ -308,7 +309,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
       }
       if (!dryRun && this.data.settings.syncConfiguration) {
         const config = await this.connection();
-        const settings = await syncConfiguration(this.app, config, this.data.configState ??= {}, () => this.persist(), (label, completed, total) => {
+        const settings = await syncConfiguration(this.app, config, this.data.configState ??= {}, this.data.pluginSetup ??= {}, () => this.persist(), (label, completed, total) => {
           this.statusEl?.setText(`Safe Sync: ${label} ${completed}/${total}`);
         });
         summary.uploaded += settings.uploaded;
