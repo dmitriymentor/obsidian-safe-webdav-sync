@@ -1,8 +1,8 @@
 # Safe WebDAV Sync
 
 Free, mobile-compatible Obsidian sync for an existing encrypted Remotely Save
-WebDAV folder. It imports the local Remotely Save settings without printing or
-publishing credentials.
+WebDAV folder. Configure the connection directly in Safe WebDAV Sync, or import
+local Remotely Save settings without printing or publishing credentials.
 
 ## Safety model
 
@@ -123,7 +123,8 @@ encrypted with the existing vault encryption password and written via the data
 adapter as hidden `.safe-sync-backups/v1` binary objects. Local JSON metadata
 contains original paths, hashes, kind and first archive time, not note content.
 Keep this hidden directory and the encryption password when backing up a device.
-The key is still imported from Remotely Save; do not delete that configuration.
+The key is stored locally in Safe WebDAV Sync after importing or saving a connection.
+Legacy installations can still read it from Remotely Save until imported.
 
 Each original path/content hash/kind has one local copy, even after restart or
 failed upload. Verified remote versions are reused with create-only conditional
@@ -154,9 +155,9 @@ Local caching was deferred: measurements on the development vault showed local
 reading/hashing under 0.1 seconds; network latency dominated. Speedups depend
 on network conditions and the number of changed remote fingerprints.
 
-Install with BRAT from this repository, then disable the original Remotely Save
-plugin. Safe WebDAV Sync reads its settings file locally, so no password is
-stored in this repository.
+Install with BRAT from this repository. Disable Remotely Save if installed.
+Configure the connection in Safe WebDAV Sync or import its legacy settings.
+No password is stored in this repository.
 
 The first installed run is intentionally manual. Use “Проверить план” once,
 then enable automatic sync after the initial index has been created.
@@ -174,3 +175,25 @@ Safe WebDAV Sync 0.3.0 adds optional encrypted synchronization of shared Obsidia
 Sync journals, connection credentials, workspace layouts, and desktop AI/REST integrations stay local. Mobile skips desktop-only plugins. Concurrent settings edits retain both originals and report a conflict. Missing settings are not treated as deletion events.
 
 Validation: production build completed. Tests were not run at the user’s request.
+
+## Standalone connection and mobile setup (0.3.1)
+
+A fresh device no longer requires Remotely Save. In Safe WebDAV Sync settings,
+enter the HTTPS WebDAV address, username, WebDAV password, RClone Crypt password
+and exact remote folder, then save. Alternatively, on the configured device
+choose **Скопировать код**, then **Вставить код** on the new device. The code
+contains credentials in plain text: use Apple's Universal Clipboard or another
+private transfer, never publish or save it in a shared note. This also transfers
+the shared-settings toggle; journals and automatic deletion settings stay local.
+
+On a new phone, run synchronization manually after importing, then restart
+Obsidian to apply downloaded plugins and settings. Enable automatic sync after
+this succeeds. Existing installations can choose **Импортировать** once to keep
+their legacy connection locally and stop relying on Remotely Save's data file.
+Connection settings remain excluded from shared-settings synchronization.
+
+Changing server, account, folder or encryption key with an existing journal is
+blocked; use a new vault for a different remote. Editing fields does not change
+the active connection until Save is pressed. The password fields are masked;
+local plugin data is not a secure keystore. Sync errors now display a stopped
+progress state rather than an ongoing operation.
