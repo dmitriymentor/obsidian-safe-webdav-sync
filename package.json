@@ -1,6 +1,6 @@
 {
   "name": "obsidian-safe-webdav-sync",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "description": "Free encrypted WebDAV sync for Obsidian with safe three-way Markdown merging",
   "scripts": {
@@ -11,10 +11,13 @@
   "dependencies": {
     "@fyears/rclone-crypt": "0.0.7",
     "buffer": "6.0.3",
-    "node-diff3": "3.1.2"
+    "jsqr": "1.4.0",
+    "node-diff3": "3.1.2",
+    "qrcode": "1.5.4"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/qrcode": "1.5.6",
     "esbuild": "^0.24.0",
     "obsidian": "^1.7.2",
     "tsx": "^4.19.0",
