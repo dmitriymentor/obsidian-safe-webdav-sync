@@ -11,6 +11,7 @@ export interface ImportedConfig {
 }
 
 export interface PluginSettings {
+  syncConfiguration: boolean;
   syncDeletions: boolean;
   autoSync: boolean;
   syncOnSave: boolean;
@@ -29,6 +30,7 @@ export interface FileState {
 }
 
 export interface PersistedData {
+  configState?: Record<string, import("./config-sync").ConfigState>;
   nameRepairs?: NameRepair[];
   lastReport?: SyncReport;
   lastErrorReport?: SyncReport;

@@ -1,3 +1,4 @@
+import { syncConfiguration } from "./config-sync";
 import { Modal, Notice, Plugin, PluginSettingTab, Setting, FuzzySuggestModal, TFile, type TAbstractFile, type App } from "obsidian";
 import { importRemotelySaveConfig } from "./import-config";
 import { SyncEngine } from "./sync";
@@ -7,6 +8,7 @@ import { userPath } from "./deletions";
 import { groupLegacyBackups } from "./backups";
 
 const DEFAULT_SETTINGS: PluginSettings = {
+  syncConfiguration: false,
   syncDeletions: false,
   autoSync: false,
   syncOnSave: true,
@@ -44,6 +46,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     this.data = {
       settings: { ...DEFAULT_SETTINGS, ...(loaded?.settings ?? {}) },
       state: loaded?.state ?? {},
+      configState: loaded?.configState ?? {},
       nameRepairs: loaded?.nameRepairs ?? [],
       lastReport: loaded?.lastReport,
       lastErrorReport: loaded?.lastErrorReport,
@@ -273,6 +276,16 @@ export default class SafeWebDavSyncPlugin extends Plugin {
         await this.persist();
         await groupLegacyBackups(this.app);
       }
+      if (!dryRun && this.data.settings.syncConfiguration) {
+        const config = await importRemotelySaveConfig(this.app.vault.adapter, this.data.settings.sourcePluginId, this.app.vault.getName());
+        const settings = await syncConfiguration(this.app, config, this.data.configState ??= {}, () => this.persist(), (label, completed, total) => {
+          this.statusEl?.setText(`Safe Sync: ${label} ${completed}/${total}`);
+        });
+        summary.uploaded += settings.uploaded;
+        summary.downloaded += settings.downloaded;
+        summary.errors.push(...settings.errors);
+        if (settings.reload) new Notice("Настройки и плагины получены. Перезапустите Obsidian, чтобы применить изменения.", 12000);
+      }
       const report = formatSummary(summary, dryRun);
       await this.rememberReport({ startedAt: this.startedAt, finishedAt: Date.now(), reason, dryRun, report, errors: [...summary.errors] });
       this.statusEl?.setText(summary.errors.length ? "Safe Sync: есть ошибки" : "Safe Sync: готов");
@@ -473,6 +486,12 @@ class SafeSyncSettingTab extends PluginSettingTab {
         await this.plugin.persist();
       }));
 
+    new Setting(containerEl).setName("Синхронизировать настройки и плагины")
+      .setDesc("Общие настройки, шаблоны, горячие клавиши, темы оформления и плагины. Панели, подключения, ИИ-сессии и журнал синхронизации остаются на устройстве. После получения обновлений перезапустите Obsidian.")
+      .addToggle(toggle => toggle.setValue(this.plugin.data.settings.syncConfiguration).onChange(async value => {
+        this.plugin.data.settings.syncConfiguration = value;
+        await this.plugin.persist();
+      }));
     containerEl.createEl("h3", { text: "Как обрабатываются конфликты" });
     containerEl.createEl("p", {
       text: "Правки сопоставляются с общей предыдущей версией по содержимому, с учётом смещения строк. Независимые изменения объединяются. При конфликте остаётся вариант из более новой заметки: сравниваются даты updated, иначе — время изменения файлов. При равных датах выбирается серверный вариант. Резервные копии сохраняются отдельно в Safe Sync Backups."
