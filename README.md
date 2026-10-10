@@ -176,15 +176,20 @@ Sync journals, connection credentials, workspace layouts, and desktop AI/REST in
 
 Validation: production build completed. Tests were not run at the user’s request.
 
-## Standalone connection and mobile setup (0.3.1)
+## Standalone connection and mobile setup (0.3.1+)
 
 A fresh device no longer requires Remotely Save. In Safe WebDAV Sync settings,
 enter the HTTPS WebDAV address, username, WebDAV password, RClone Crypt password
-and exact remote folder, then save. Alternatively, on the configured device
-choose **Скопировать код**, then **Вставить код** on the new device. The code
-contains credentials in plain text: use Apple's Universal Clipboard or another
-private transfer, never publish or save it in a shared note. This also transfers
-the shared-settings toggle; journals and automatic deletion settings stay local.
+and exact remote folder, then save. In 0.3.2, choose **Показать QR** on the
+configured device and **Сканировать QR** on the new one. Confirm the displayed
+server and remote folder before saving. The QR includes the shared-settings
+switch; journals and automatic deletion settings stay local.
+
+QR codes contain plaintext credentials: show them only to your own device,
+never publish screenshots. Codes are generated and decoded locally, without
+an external QR service. The plugin never writes the QR image to disk. Clipboard
+transfer was available in 0.3.1; 0.3.2 replaces it with QR transfer.
+
 
 On a new phone, run synchronization manually after importing, then restart
 Obsidian to apply downloaded plugins and settings. Enable automatic sync after
@@ -197,3 +202,19 @@ blocked; use a new vault for a different remote. Editing fields does not change
 the active connection until Save is pressed. The password fields are masked;
 local plugin data is not a secure keystore. Sync errors now display a stopped
 progress state rather than an ongoing operation.
+
+## QR connection transfer (0.3.2)
+
+The scanner requests the rear camera and decodes frames locally. If the WebView
+does not expose camera access or permission is denied, **Считать с фотографии**
+reads a selected QR image locally. The camera stream is stopped when the modal
+closes or a connection QR is accepted, including late permission responses.
+
+The QR is also an `obsidian://safe-webdav-sync` link. The system Camera app can
+open it in Obsidian when supported by the operating system. Have the intended
+vault open and the updated plugin enabled. Both the built-in scanner and the
+protocol link require a confirmation showing the server and folder. Neither
+starts synchronization automatically; existing-journal restrictions still apply.
+
+Production build completed. No tests were run at the user's request. Camera and
+protocol-link behavior on the iPhone must be confirmed on the device.

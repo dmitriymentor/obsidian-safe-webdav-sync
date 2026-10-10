@@ -1,3 +1,4 @@
+import { ConnectionQrModal, ConnectionQrScanner, confirmConnectionQr } from "./connection-qr";
 import { syncConfiguration } from "./config-sync";
 import { Modal, Notice, Plugin, PluginSettingTab, Setting, FuzzySuggestModal, TFile, type TAbstractFile, type App } from "obsidian";
 import { importRemotelySaveConfig, validateConnection } from "./import-config";
@@ -57,6 +58,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     await this.persist();
     this.app.workspace.onLayoutReady(() => { this.ready = true; });
     this.addRibbonIcon("refresh-cw", "Safe WebDAV Sync", () => void this.sync(false, "вручную"));
+    this.addCommand({ id: "connection-qr", name: "Показать QR подключения", callback: () => void this.showConnectionQr() });
     this.addCommand({ id: "sync-now", name: "Синхронизировать сейчас", callback: () => void this.sync(false, "командой") });
     this.addCommand({ id: "dry-run", name: "Проверить план без изменений", callback: () => void this.sync(true, "проверка") });
     this.addCommand({ id: "test-connection", name: "Проверить WebDAV и шифрование", callback: () => void this.checkConnection() });
@@ -67,6 +69,11 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     this.statusEl = this.addStatusBarItem();
     this.statusEl.setText("Safe Sync: готов");
     this.addSettingTab(new SafeSyncSettingTab(this.app, this));
+    this.registerObsidianProtocolHandler("safe-webdav-sync", params => {
+      if (!params.connection) { new Notice("QR-код не содержит подключения"); return; }
+      confirmConnectionQr(this.app, "obsidian://safe-webdav-sync?connection=" + encodeURIComponent(params.connection),
+        (config, syncSettings) => this.saveConnection(config, syncSettings));
+    });
 
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (!userPath(file.path)) return;
@@ -96,6 +103,11 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   sourcePluginEnabled(): boolean {
     const enabled = (this.app as any).plugins?.enabledPlugins;
     return Boolean(enabled?.has?.(this.data.settings.sourcePluginId));
+  }
+
+  async showConnectionQr(): Promise<void> {
+    try { new ConnectionQrModal(this.app, validateConnection(await this.connection()), this.data.settings.syncConfiguration).open(); }
+    catch (error) { new Notice(message(error), 10000); }
   }
 
   async connection(): Promise<ImportedConfig> {
@@ -468,40 +480,12 @@ class SafeSyncSettingTab extends PluginSettingTab {
           await this.plugin.saveConnection(config); new Notice("Подключение импортировано"); this.display();
         } catch (error) { new Notice(message(error), 10000); }
       }));
-    new Setting(containerEl).setName("Перенести подключение на другое устройство")
-      .setDesc("Код содержит оба пароля. Используйте общий буфер обмена Apple или приватную передачу; не публикуйте его.")
-      .addButton(button => button.setButtonText("Скопировать код").onClick(async () => {
-        try {
-          const config = validateConnection(await this.plugin.connection());
-          await navigator.clipboard.writeText(JSON.stringify({ format: "safe-webdav-sync", version: 1, connection: config,
-            syncConfiguration: this.plugin.data.settings.syncConfiguration }));
-          new Notice("Код подключения скопирован. Вставьте его в Safe WebDAV Sync на другом устройстве.", 10000);
-        } catch (error) { new Notice(message(error), 10000); }
-      }))
-      .addButton(button => button.setButtonText("Вставить код").onClick(() => {
-        const modal = new Modal(this.app);
-        modal.titleEl.setText("Вставить подключение");
-        modal.contentEl.createEl("p", { text: "Вставьте код с другого устройства. Он содержит пароли; заметки и журнал синхронизации не переносятся." });
-        let code = "";
-        new Setting(modal.contentEl).addTextArea(text => {
-          text.inputEl.autocomplete = "off"; text.inputEl.spellcheck = false;
-          text.inputEl.style.width = "100%"; text.inputEl.style.minHeight = "120px";
-          text.onChange(value => { code = value; });
-        });
-        new Setting(modal.contentEl).addButton(button => button.setCta().setButtonText("Сохранить").onClick(async () => {
-          try {
-            let value: any;
-            try { value = JSON.parse(code); } catch { throw new Error("Код подключения повреждён или скопирован не полностью"); }
-            if (value?.format !== "safe-webdav-sync" || value.version !== 1 || typeof value.syncConfiguration !== "boolean") {
-              throw new Error("Это не код подключения Safe WebDAV Sync");
-            }
-            await this.plugin.saveConnection(value.connection, value.syncConfiguration);
-            code = ""; modal.close(); this.display();
-            new Notice("Подключение сохранено. Теперь запустите синхронизацию.", 10000);
-          } catch (error) { new Notice(message(error), 10000); }
-        }));
-        modal.onClose = () => { code = ""; modal.contentEl.empty(); };
-        modal.open();
+    new Setting(containerEl).setName("Перенести подключение через QR")
+      .setDesc("Покажите QR на компьютере и отсканируйте его телефоном. Код содержит пароли; не публикуйте его.")
+      .addButton(button => button.setButtonText("Показать QR").onClick(() => void this.plugin.showConnectionQr()))
+      .addButton(button => button.setButtonText("Сканировать QR").onClick(() => {
+        new ConnectionQrScanner(this.app, input => confirmConnectionQr(this.app, input,
+          (config, syncSettings) => this.plugin.saveConnection(config, syncSettings), () => this.display())).open();
       }));
   }
 
