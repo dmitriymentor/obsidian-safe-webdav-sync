@@ -30,6 +30,7 @@ export interface FileState {
 }
 
 export interface PersistedData {
+  connection?: ImportedConfig;
   configState?: Record<string, import("./config-sync").ConfigState>;
   nameRepairs?: NameRepair[];
   lastReport?: SyncReport;

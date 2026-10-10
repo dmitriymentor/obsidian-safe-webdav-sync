@@ -1,8 +1,8 @@
 import { syncConfiguration } from "./config-sync";
 import { Modal, Notice, Plugin, PluginSettingTab, Setting, FuzzySuggestModal, TFile, type TAbstractFile, type App } from "obsidian";
-import { importRemotelySaveConfig } from "./import-config";
+import { importRemotelySaveConfig, validateConnection } from "./import-config";
 import { SyncEngine } from "./sync";
-import type { PersistedData, PluginSettings, SyncProgress, SyncSummary, SyncReport } from "./types";
+import type { ImportedConfig, PersistedData, PluginSettings, SyncProgress, SyncSummary, SyncReport } from "./types";
 import type { BackupRecord } from "./backup-store";
 import { userPath } from "./deletions";
 import { groupLegacyBackups } from "./backups";
@@ -44,6 +44,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   async onload(): Promise<void> {
     const loaded = (await this.loadData()) as Partial<PersistedData> | null;
     this.data = {
+      connection: loaded?.connection,
       settings: { ...DEFAULT_SETTINGS, ...(loaded?.settings ?? {}) },
       state: loaded?.state ?? {},
       configState: loaded?.configState ?? {},
@@ -95,6 +96,27 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   sourcePluginEnabled(): boolean {
     const enabled = (this.app as any).plugins?.enabledPlugins;
     return Boolean(enabled?.has?.(this.data.settings.sourcePluginId));
+  }
+
+  async connection(): Promise<ImportedConfig> {
+    if (this.data.connection) return validateConnection(this.data.connection);
+    return importRemotelySaveConfig(this.app.vault.adapter, this.data.settings.sourcePluginId, this.app.vault.getName());
+  }
+
+  async saveConnection(raw: unknown, syncSettings?: boolean): Promise<void> {
+    if (this.running) throw new Error("Дождитесь завершения синхронизации");
+    const next = validateConnection(raw);
+    // An existing journal cannot be reused for a different remote or key.
+    if (Object.keys(this.data.state).length || Object.keys(this.data.configState ?? {}).length || this.data.deletionState?.baselineReady) {
+      const previous = await this.connection();
+      const keys = ["address", "username", "remoteBaseDir", "encryptionPassword"] as const;
+      if (keys.some(key => previous[key] !== next[key])) {
+        throw new Error("У этого хранилища уже есть журнал синхронизации. Для другого сервера, папки или ключа создайте новое хранилище.");
+      }
+    }
+    this.data.connection = next;
+    if (syncSettings !== undefined) this.data.settings.syncConfiguration = syncSettings;
+    await this.persist();
   }
 
   async persist(): Promise<void> {
@@ -186,7 +208,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   }
 
   private async createEngine(interactive: boolean, onProgress?: (progress: SyncProgress) => void): Promise<SyncEngine> {
-    const config = await importRemotelySaveConfig(this.app.vault.adapter, this.data.settings.sourcePluginId, this.app.vault.getName());
+    const config = await this.connection();
     return new SyncEngine(this.app, config, this.data.state, () => this.persist(), onProgress, {
       data: this.data.deletionState!, mutations: this.mutations,
       confirmMass: interactive ? async (paths) => await choose(this.app, `Удалить ${paths.length} файлов на этом устройстве и сервере?`,
@@ -219,11 +241,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
   async checkConnection(): Promise<void> {
     try {
       this.statusEl?.setText("Safe Sync: проверка…");
-      const config = await importRemotelySaveConfig(
-        this.app.vault.adapter,
-        this.data.settings.sourcePluginId,
-        this.app.vault.getName()
-      );
+      const config = await this.connection();
       const engine = new SyncEngine(this.app, config, this.data.state, () => this.persist());
       await engine.check();
       this.statusEl?.setText("Safe Sync: подключено");
@@ -277,7 +295,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
         await groupLegacyBackups(this.app);
       }
       if (!dryRun && this.data.settings.syncConfiguration) {
-        const config = await importRemotelySaveConfig(this.app.vault.adapter, this.data.settings.sourcePluginId, this.app.vault.getName());
+        const config = await this.connection();
         const settings = await syncConfiguration(this.app, config, this.data.configState ??= {}, () => this.persist(), (label, completed, total) => {
           this.statusEl?.setText(`Safe Sync: ${label} ${completed}/${total}`);
         });
@@ -397,6 +415,9 @@ class SyncProgressModal extends Modal {
   fail(error: string): void {
     window.clearInterval(this.timer);
     this.titleEl.setText("Ошибка синхронизации");
+    this.progressEl.value = this.percent;
+    this.countEl.setText("Синхронизация остановлена");
+    this.elapsedEl.setText(`Остановлено через ${Math.floor((Date.now() - this.startedAt) / 1000)} с`);
     this.phaseEl.setText(error);
     this.pathEl.setText("Файлы, обработанные до ошибки, остаются в безопасном состоянии.");
     this.addCloseButton();
@@ -416,17 +437,86 @@ class SafeSyncSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  private connectionSettings(containerEl: HTMLElement): void {
+    containerEl.createEl("h3", { text: "Подключение" });
+    const draft: ImportedConfig = { address: "", username: "", webdavPassword: "", remoteBaseDir: "",
+      encryptionPassword: "", authType: "basic", encryptionMethod: "rclone-base64",
+      autoRunEveryMilliseconds: 300000, syncOnSaveAfterMilliseconds: 1000, ...this.plugin.data.connection };
+    for (const [key, label, secret] of [
+      ["address", "Адрес WebDAV", false], ["username", "Логин", false],
+      ["webdavPassword", "Пароль WebDAV", true], ["encryptionPassword", "Пароль шифрования", true],
+      ["remoteBaseDir", "Папка на сервере", false]
+    ] as const) {
+      new Setting(containerEl).setName(label).addText(text => {
+        text.inputEl.type = secret ? "password" : "text";
+        text.inputEl.autocomplete = "off";
+        text.inputEl.spellcheck = false;
+        text.setValue(draft[key]).onChange(value => { draft[key] = value; });
+      });
+    }
+    new Setting(containerEl).setName("Сохранить подключение")
+      .setDesc("Папка и пароль шифрования должны совпадать на всех устройствах. Сохранение не запускает синхронизацию.")
+      .addButton(button => button.setButtonText("Сохранить").onClick(async () => {
+        try { await this.plugin.saveConnection(draft); new Notice("Подключение сохранено"); this.display(); }
+        catch (error) { new Notice(message(error), 10000); }
+      }));
+    new Setting(containerEl).setName("Импорт из Remotely Save")
+      .setDesc("Для прежнего подключения на этом устройстве. После импорта его файл настроек больше не требуется.")
+      .addButton(button => button.setButtonText("Импортировать").onClick(async () => {
+        try {
+          const config = await importRemotelySaveConfig(this.app.vault.adapter, this.plugin.data.settings.sourcePluginId, this.app.vault.getName());
+          await this.plugin.saveConnection(config); new Notice("Подключение импортировано"); this.display();
+        } catch (error) { new Notice(message(error), 10000); }
+      }));
+    new Setting(containerEl).setName("Перенести подключение на другое устройство")
+      .setDesc("Код содержит оба пароля. Используйте общий буфер обмена Apple или приватную передачу; не публикуйте его.")
+      .addButton(button => button.setButtonText("Скопировать код").onClick(async () => {
+        try {
+          const config = validateConnection(await this.plugin.connection());
+          await navigator.clipboard.writeText(JSON.stringify({ format: "safe-webdav-sync", version: 1, connection: config,
+            syncConfiguration: this.plugin.data.settings.syncConfiguration }));
+          new Notice("Код подключения скопирован. Вставьте его в Safe WebDAV Sync на другом устройстве.", 10000);
+        } catch (error) { new Notice(message(error), 10000); }
+      }))
+      .addButton(button => button.setButtonText("Вставить код").onClick(() => {
+        const modal = new Modal(this.app);
+        modal.titleEl.setText("Вставить подключение");
+        modal.contentEl.createEl("p", { text: "Вставьте код с другого устройства. Он содержит пароли; заметки и журнал синхронизации не переносятся." });
+        let code = "";
+        new Setting(modal.contentEl).addTextArea(text => {
+          text.inputEl.autocomplete = "off"; text.inputEl.spellcheck = false;
+          text.inputEl.style.width = "100%"; text.inputEl.style.minHeight = "120px";
+          text.onChange(value => { code = value; });
+        });
+        new Setting(modal.contentEl).addButton(button => button.setCta().setButtonText("Сохранить").onClick(async () => {
+          try {
+            let value: any;
+            try { value = JSON.parse(code); } catch { throw new Error("Код подключения повреждён или скопирован не полностью"); }
+            if (value?.format !== "safe-webdav-sync" || value.version !== 1 || typeof value.syncConfiguration !== "boolean") {
+              throw new Error("Это не код подключения Safe WebDAV Sync");
+            }
+            await this.plugin.saveConnection(value.connection, value.syncConfiguration);
+            code = ""; modal.close(); this.display();
+            new Notice("Подключение сохранено. Теперь запустите синхронизацию.", 10000);
+          } catch (error) { new Notice(message(error), 10000); }
+        }));
+        modal.onClose = () => { code = ""; modal.contentEl.empty(); };
+        modal.open();
+      }));
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Safe WebDAV Sync" });
     containerEl.createEl("small", { text: `Версия ${this.plugin.manifest.version}` });
     containerEl.createEl("p", {
-      text: "Плагин локально читает WebDAV и пароль RClone Crypt из Remotely Save. Секреты не попадают в репозиторий."
+      text: "Настройте подключение здесь или перенесите его с другого устройства. Пароли хранятся локально и не синхронизируются с общими настройками."
     });
+    this.connectionSettings(containerEl);
     const sourceState = this.plugin.sourcePluginEnabled()
       ? "Remotely Save включён — синхронизация заблокирована для защиты от двойного запуска."
-      : "Remotely Save выключен — Safe Sync может работать.";
+      : "Другой синхронизатор выключен.";
     containerEl.createEl("p", { text: sourceState, cls: this.plugin.sourcePluginEnabled() ? "mod-warning" : "mod-success" });
 
     new Setting(containerEl).setName("Последний отчёт")
