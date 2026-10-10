@@ -30,6 +30,7 @@ export interface FileState {
 }
 
 export interface PersistedData {
+  pluginSetup?: Record<string, "pending" | "initialized">;
   connection?: ImportedConfig;
   configState?: Record<string, import("./config-sync").ConfigState>;
   nameRepairs?: NameRepair[];
