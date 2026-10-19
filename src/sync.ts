@@ -114,7 +114,13 @@ export class SyncEngine {
     }
     const pending = [...(this.deletionHooks?.data.pending ?? [])];
     const deletionPaths = [...new Set([...pending.map(p => p.path), ...(this.journal?.active.keys() ?? [])])];
-    const effectiveDeletions = deletionPaths.filter(p => local.has(p) || remote.has(p));
+    const effectiveDeletions = deletionPaths.filter(p => {
+      if (!local.has(p) && !remote.has(p)) return false;
+      const intents = [...pending.filter(intent => intent.path === p), ...(this.journal?.active.get(p) ?? [])];
+      // A move removes an old path, but preserves the note at its destination.
+      // Mixed batches must still confirm every actual deletion.
+      return intents.some(intent => !intent.renameTo);
+    });
     if (needsMassConfirmation(effectiveDeletions.length, Math.max(local.size, remote.size)) && !dryRun) {
       if (!await this.deletionHooks?.confirmMass?.(effectiveDeletions)) {
         throw new Error(`Ожидают подтверждения ${effectiveDeletions.length} удалений. Запустите синхронизацию вручную`);
@@ -135,7 +141,9 @@ export class SyncEngine {
       this.progress("files", "Синхронизирую файлы", index + 1, paths.length, path);
     }
     for (const path of deletionPaths) {
-      this.progress("files", "Проверяю удаление", 0, 0, path);
+      const moving = pending.some(intent => intent.path === path && intent.renameTo) ||
+        this.journal?.active.get(path)?.every(intent => Boolean(intent.renameTo));
+      this.progress("files", moving ? "Синхронизирую перемещение" : "Проверяю удаление", 0, 0, path);
       try {
         const intent = pending.find(p => p.path === path);
         if (intent && !dryRun) {
@@ -511,7 +519,11 @@ export class SyncEngine {
     const rhash = remote ? await hashBuffer(remote) : undefined;
     const conflict = deletionConflicts([lhash, rhash], intents);
     if (dryRun) {
-      if (conflict) summary.conflicts++; else if (local || remote) summary.deleted++;
+      if (conflict) summary.conflicts++;
+      else if (local || remote) {
+        if (intents.every(intent => Boolean(intent.renameTo))) summary.moved = (summary.moved ?? 0) + 1;
+        else summary.deleted++;
+      }
       return;
     }
     if (conflict) {
@@ -555,7 +567,10 @@ export class SyncEngine {
     }
     delete this.state[path];
     await this.saveState();
-    if (local || remote) summary.deleted++;
+    if (local || remote) {
+      if (intents.every(intent => Boolean(intent.renameTo))) summary.moved = (summary.moved ?? 0) + 1;
+      else summary.deleted++;
+    }
   }
 
   private async archiveDeleted(path: string, bytes: ArrayBuffer, _side: string): Promise<void> {

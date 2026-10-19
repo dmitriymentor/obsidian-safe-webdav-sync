@@ -92,6 +92,7 @@ export interface RemoteEntry {
 }
 
 export interface SyncSummary {
+  moved?: number;
   renamed?: number;
   repaired: number;
   uploaded: number;

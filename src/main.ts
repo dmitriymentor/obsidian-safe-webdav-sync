@@ -225,7 +225,7 @@ export default class SafeWebDavSyncPlugin extends Plugin {
     return new SyncEngine(this.app, config, this.data.state, () => this.persist(), onProgress, {
       data: this.data.deletionState!, mutations: this.mutations,
       confirmMass: interactive ? async (paths) => await choose(this.app, `Удалить ${paths.length} файлов на этом устройстве и сервере?`,
-        paths.slice(0, 15).join("\n") + (paths.length > 15 ? "\n…" : "") + "\nКопии будут сохранены в корзине.",
+        "Эти файлы были удалены. Синхронизация удалит их оставшиеся копии на этом устройстве и сервере. Перемещённые файлы в этот список не входят.\n\n" + paths.slice(0, 15).join("\n") + (paths.length > 15 ? "\n…" : "") + "\nРезервные копии будут сохранены в Safe Sync Backups.",
         [{ value: "yes", label: "Подтвердить удаление" }, { value: "no", label: "Отмена" }], "no") === "yes" : undefined,
       resolveConflict: interactive ? async (path) => choose(this.app, "Файл изменён после удаления на другом устройстве", path,
         [{ value: "keep", label: "Сохранить файл — отменить удаление" },
@@ -616,6 +616,6 @@ function message(error: unknown): string {
 
 function formatSummary(s: SyncSummary, dryRun: boolean): string {
   const prefix = s.errors.length ? (dryRun ? "План с ошибками" : "Завершено с ошибками") : dryRun ? "План" : "Готово";
-  const core = `${prefix}: ↑${s.uploaded} ↓${s.downloaded} объединено ${s.merged}, конфликтов ${s.conflicts}, удалено ${s.deleted}, очищено ${s.repaired ?? 0}${s.renamed ? `, сокращено имён ${s.renamed}` : ""}`;
+  const core = `${prefix}: ↑${s.uploaded} ↓${s.downloaded} объединено ${s.merged}, конфликтов ${s.conflicts}${s.moved ? `, перемещено ${s.moved}` : ""}, удалено ${s.deleted}, очищено ${s.repaired ?? 0}${s.renamed ? `, сокращено имён ${s.renamed}` : ""}`;
   return s.errors.length ? `${core}. Ошибок: ${s.errors.length}` : core;
 }

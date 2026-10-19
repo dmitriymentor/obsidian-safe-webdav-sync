@@ -23,7 +23,7 @@ class Modal {
 class TFile { constructor(public path: string) {} }
 const notices: string[] = [];
 const obsidian = { Modal, TFile, FuzzySuggestModal: Modal, TFolder: class {}, normalizePath: (p: string) => p,
-  Plugin: class {}, PluginSettingTab: class {}, Notice: class { constructor(text: string) { notices.push(text); } },
+  Plugin: class { registerObsidianProtocolHandler() {} }, PluginSettingTab: class {}, Notice: class { constructor(text: string) { notices.push(text); } },
   Setting: class { addButton(callback: any) { const b: any = { setCta: () => b, setButtonText: () => b, onClick: () => b }; callback(b); } } };
 const runtime = (entry: string) => {
   const code = buildSync({ entryPoints: [entry], bundle: true, write: false, format: "cjs", platform: "browser", external: ["obsidian"] }).outputFiles[0]!.text;
@@ -567,4 +567,55 @@ test("an error is visible in an attached background progress window", async () =
     assert.equal(modal.titleEl.text, "Ошибка синхронизации");
     assert.match(modal.phaseEl.text, /503/);
   } finally { modal.close(); }
+});
+
+test("folder moves never request deletion confirmation; mixed batches confirm only real deletions", async () => {
+  for (const remoteJournal of [false, true]) {
+    for (const deleteCount of [0, 10]) {
+      const engine = Object.create(SyncEngine.prototype);
+      const intents = Array.from({ length: 27 + deleteCount }, (_, i) => ({
+        id: `11111111-1111-4111-8111-${String(i).padStart(12, "0")}`,
+        deviceId: "22222222-2222-4222-8222-222222222222",
+        path: `Темы/${i}.md`, baseHash: "a".repeat(64), createdAt: "2026-10-11T10:44:05.918Z",
+        ...(i < 27 ? { renameTo: `Система/Темы/${i}.md` } : {})
+      }));
+      const objects = new Map<string, ArrayBuffer>();
+      for (const intent of intents) if (remoteJournal) {
+        objects.set(`.safe-sync-meta/deletions/delete-${intent.id}.json`, buffer(JSON.stringify({ version: 1, kind: "delete", intent })));
+      }
+      const confirmations: string[][] = [];
+      engine.app = { vault: { getFiles: () => [], getAbstractFileByPath: () => null } };
+      engine.state = {}; engine.journalPaths = [...objects.keys()];
+      engine.readRemoteIndex = async () => new Map(intents.map(i => [i.path, {}]));
+      engine.repairLongNames = async () => new Set(); engine.saveState = async () => {};
+      engine.crypt = { encryptPath: async (p: string) => p, decrypt: async (b: ArrayBuffer) => b };
+      engine.webdav = { get: async (p: string) => objects.get(p), getObject: async () => undefined };
+      engine.deletionHooks = { data: { pending: remoteJournal ? [] : intents, knownIds: [] },
+        confirmMass: async (paths: string[]) => { confirmations.push(paths); return false; } };
+      engine.applyDeletion = async () => {};
+      if (deleteCount) {
+        await assert.rejects(engine.run(), /подтверждения 10 удалений/);
+        assert.deepEqual(Array.from(confirmations[0]!), Array.from({ length: 10 }, (_, i) => `Темы/${27 + i}.md`));
+      } else {
+        const result = await engine.run();
+        assert.equal(confirmations.length, 0);
+        if (!remoteJournal) {
+          assert.equal(result.errors.length, 27);
+          assert.ok(result.errors.every((message: string) => message.includes("старый файл на сервере сохранён")));
+        }
+      }
+    }
+  }
+});
+
+
+test("completed moves are reported separately from deletions, including dry runs", async () => {
+  for (const dryRun of [false, true]) {
+    const f = await deletionFixture();
+    const summary: any = f.summary;
+    await f.engine.applyDeletion("note.md", [{ ...f.intent, renameTo: "Система/note.md" }], dryRun, summary);
+    assert.equal(summary.deleted, 0);
+    assert.equal(summary.moved, 1);
+    assert.equal(f.deletes.length, dryRun ? 0 : 1);
+  }
 });
